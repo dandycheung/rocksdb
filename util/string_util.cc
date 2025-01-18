@@ -5,13 +5,12 @@
 //
 #include "util/string_util.h"
 
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
-
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -266,7 +265,9 @@ std::string UnescapeOptionString(const std::string& escaped_string) {
 }
 
 std::string trim(const std::string& str) {
-  if (str.empty()) return std::string();
+  if (str.empty()) {
+    return std::string();
+  }
   size_t start = 0;
   size_t end = str.size() - 1;
   while (isspace(str[start]) != 0 && start < end) {
@@ -294,7 +295,6 @@ bool EndsWith(const std::string& string, const std::string& pattern) {
 bool StartsWith(const std::string& string, const std::string& pattern) {
   return string.compare(0, pattern.size(), pattern) == 0;
 }
-
 
 bool ParseBoolean(const std::string& type, const std::string& value) {
   if (value == "true" || value == "1") {
@@ -333,7 +333,6 @@ int32_t ParseInt32(const std::string& value) {
   }
 }
 
-
 uint64_t ParseUint64(const std::string& value) {
   size_t endchar;
 #ifndef CYGWIN
@@ -346,14 +345,15 @@ uint64_t ParseUint64(const std::string& value) {
 
   if (endchar < value.length()) {
     char c = value[endchar];
-    if (c == 'k' || c == 'K')
+    if (c == 'k' || c == 'K') {
       num <<= 10LL;
-    else if (c == 'm' || c == 'M')
+    } else if (c == 'm' || c == 'M') {
       num <<= 20LL;
-    else if (c == 'g' || c == 'G')
+    } else if (c == 'g' || c == 'G') {
       num <<= 30LL;
-    else if (c == 't' || c == 'T')
+    } else if (c == 't' || c == 'T') {
       num <<= 40LL;
+    }
   }
 
   return num;
@@ -371,14 +371,15 @@ int64_t ParseInt64(const std::string& value) {
 
   if (endchar < value.length()) {
     char c = value[endchar];
-    if (c == 'k' || c == 'K')
+    if (c == 'k' || c == 'K') {
       num <<= 10LL;
-    else if (c == 'm' || c == 'M')
+    } else if (c == 'm' || c == 'M') {
       num <<= 20LL;
-    else if (c == 'g' || c == 'G')
+    } else if (c == 'g' || c == 'G') {
       num <<= 30LL;
-    else if (c == 't' || c == 'T')
+    } else if (c == 't' || c == 'T') {
       num <<= 40LL;
+    }
   }
 
   return num;
@@ -396,12 +397,13 @@ int ParseInt(const std::string& value) {
 
   if (endchar < value.length()) {
     char c = value[endchar];
-    if (c == 'k' || c == 'K')
+    if (c == 'k' || c == 'K') {
       num <<= 10;
-    else if (c == 'm' || c == 'M')
+    } else if (c == 'm' || c == 'M') {
       num <<= 20;
-    else if (c == 'g' || c == 'G')
+    } else if (c == 'g' || c == 'G') {
       num <<= 30;
+    }
   }
 
   return num;

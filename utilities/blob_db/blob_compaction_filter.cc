@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/blob_db/blob_compaction_filter.h"
 
 #include <cinttypes>
@@ -13,8 +12,7 @@
 #include "rocksdb/system_clock.h"
 #include "test_util/sync_point.h"
 
-namespace ROCKSDB_NAMESPACE {
-namespace blob_db {
+namespace ROCKSDB_NAMESPACE::blob_db {
 
 BlobIndexCompactionFilterBase::~BlobIndexCompactionFilterBase() {
   if (blob_file_) {
@@ -488,5 +486,4 @@ BlobIndexCompactionFilterFactoryGC::CreateCompactionFilter(
       std::move(user_comp_filter_from_factory), current_time, statistics()));
 }
 
-}  // namespace blob_db
-}  // namespace ROCKSDB_NAMESPACE
+}  // namespace ROCKSDB_NAMESPACE::blob_db

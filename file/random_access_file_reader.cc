@@ -199,7 +199,7 @@ IOStatus RandomAccessFileReader::Read(const IOOptions& opts, uint64_t offset,
           buf.Read(scratch, offset_advance, res_len);
         } else {
           scratch = buf.BufferStart() + offset_advance;
-          aligned_buf->reset(buf.Release());
+          *aligned_buf = buf.Release();
         }
       }
       *result = Slice(scratch, res_len);
@@ -384,7 +384,7 @@ IOStatus RandomAccessFileReader::MultiRead(const IOOptions& opts,
         scratch += r.len;
       }
 
-      aligned_buf->reset(buf.Release());
+      *aligned_buf = buf.Release();
       fs_reqs = aligned_reqs.data();
       num_fs_reqs = aligned_reqs.size();
     }
@@ -420,7 +420,8 @@ IOStatus RandomAccessFileReader::MultiRead(const IOOptions& opts,
           remaining_bytes -= request_bytes;
         }
       }
-      io_s = file_->MultiRead(fs_reqs, num_fs_reqs, opts, nullptr);
+      io_s = file_->MultiRead(fs_reqs, num_fs_reqs, opts,
+                              /*IODebugContext*=*/nullptr);
       RecordInHistogram(stats_, MULTIGET_IO_BATCH_SIZE, num_fs_reqs);
     }
 
@@ -461,7 +462,6 @@ IOStatus RandomAccessFileReader::MultiRead(const IOOptions& opts,
                         file_name(), read_reqs[i].result.size(),
                         read_reqs[i].offset);
       }
-
       RecordIOStats(stats_, file_temperature_, is_last_level_,
                     read_reqs[i].result.size());
     }
@@ -485,7 +485,7 @@ IOStatus RandomAccessFileReader::PrepareIOOptions(const ReadOptions& ro,
 
 IOStatus RandomAccessFileReader::ReadAsync(
     FSReadRequest& req, const IOOptions& opts,
-    std::function<void(const FSReadRequest&, void*)> cb, void* cb_arg,
+    std::function<void(FSReadRequest&, void*)> cb, void* cb_arg,
     void** io_handle, IOHandleDeleter* del_fn, AlignedBuf* aligned_buf) {
   IOStatus s;
   // Create a callback and populate info.
@@ -556,7 +556,7 @@ IOStatus RandomAccessFileReader::ReadAsync(
   return s;
 }
 
-void RandomAccessFileReader::ReadAsyncCallback(const FSReadRequest& req,
+void RandomAccessFileReader::ReadAsyncCallback(FSReadRequest& req,
                                                void* cb_arg) {
   ReadAsyncInfo* read_async_info = static_cast<ReadAsyncInfo*>(cb_arg);
   assert(read_async_info);
@@ -598,8 +598,7 @@ void RandomAccessFileReader::ReadAsyncCallback(const FSReadRequest& req,
         // Set aligned_buf provided by user without additional copy.
         user_req.scratch =
             read_async_info->buf_.BufferStart() + offset_advance_len;
-        read_async_info->user_aligned_buf_->reset(
-            read_async_info->buf_.Release());
+        *read_async_info->user_aligned_buf_ = read_async_info->buf_.Release();
       }
       user_req.result = Slice(user_req.scratch, res_len);
     } else {

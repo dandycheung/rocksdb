@@ -27,6 +27,7 @@ struct ImmutableDBOptions {
   bool flush_verify_memtable_count;
   bool compaction_verify_record_count;
   bool track_and_verify_wals_in_manifest;
+  bool track_and_verify_wals;
   bool verify_sst_unique_id_in_manifest;
   Env* env;
   std::shared_ptr<RateLimiter> rate_limiter;
@@ -61,8 +62,6 @@ struct ImmutableDBOptions {
   bool advise_random_on_open;
   size_t db_write_buffer_size;
   std::shared_ptr<WriteBufferManager> write_buffer_manager;
-  DBOptions::AccessHint access_hint_on_compaction_start;
-  size_t random_access_max_buffer_size;
   bool use_adaptive_mutex;
   std::vector<std::shared_ptr<EventListener>> listeners;
   bool enable_thread_tracking;
@@ -85,10 +84,13 @@ struct ImmutableDBOptions {
   bool two_write_queues;
   bool manual_wal_flush;
   CompressionType wal_compression;
+  bool background_close_inactive_wals;
   bool atomic_flush;
   bool avoid_unnecessary_blocking_io;
+  bool prefix_seek_opt_in_only;
   bool persist_stats_to_disk;
   bool write_dbid_to_manifest;
+  bool write_identity_file;
   size_t log_readahead_size;
   std::shared_ptr<FileChecksumGenFactory> file_checksum_gen_factory;
   bool best_efforts_recovery;
@@ -98,13 +100,21 @@ struct ImmutableDBOptions {
   std::string db_host_id;
   FileTypeSet checksum_handoff_file_types;
   CacheTier lowest_used_cache_tier;
-  // Convenience/Helper objects that are not part of the base DBOptions
+  std::shared_ptr<CompactionService> compaction_service;
+  bool enforce_single_del_contracts;
+  uint64_t follower_refresh_catchup_period_ms;
+  uint64_t follower_catchup_retry_count;
+  uint64_t follower_catchup_retry_wait_ms;
+  Temperature metadata_write_temperature;
+  Temperature wal_write_temperature;
+
+  // Beginning convenience/helper objects that are not part of the base
+  // DBOptions
   std::shared_ptr<FileSystem> fs;
   SystemClock* clock;
   Statistics* stats;
   Logger* logger;
-  std::shared_ptr<CompactionService> compaction_service;
-  bool enforce_single_del_contracts;
+  // End of convenience/helper objects.
 
   bool IsWalDirSameAsDBPath() const;
   bool IsWalDirSameAsDBPath(const std::string& path) const;

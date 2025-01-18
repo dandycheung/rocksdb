@@ -86,7 +86,7 @@ class DummyDB : public StackableDB {
 
   DBOptions GetDBOptions() const override { return DBOptions(options_); }
 
-  Status EnableFileDeletions(bool /*force*/) override {
+  Status EnableFileDeletions() override {
     EXPECT_TRUE(!deletions_enabled_);
     deletions_enabled_ = true;
     return Status::OK();
@@ -181,6 +181,40 @@ class TestFs : public FileSystemWrapper {
     bool fail_reads_;
   };
 
+  class CheckIOOptsSequentialFile : public FSSequentialFileOwnerWrapper {
+   public:
+    CheckIOOptsSequentialFile(std::unique_ptr<FSSequentialFile>&& f,
+                              const std::string& file_name)
+        : FSSequentialFileOwnerWrapper(std::move(f)) {
+      is_sst_file_ = file_name.find(".sst") != std::string::npos;
+    }
+
+    IOStatus Read(size_t n, const IOOptions& options, Slice* result,
+                  char* scratch, IODebugContext* dbg) override {
+      // Backup currently associates only SST read with rate limiter priority
+      assert(!is_sst_file_ || options.rate_limiter_priority ==
+                                  kExpectedBackupReadRateLimiterPri);
+      IOStatus rv = target()->Read(n, options, result, scratch, dbg);
+      return rv;
+    }
+
+    IOStatus PositionedRead(uint64_t offset, size_t n, const IOOptions& options,
+                            Slice* result, char* scratch,
+                            IODebugContext* dbg) override {
+      // Backup currently associates only SST read with rate limiter priority
+      assert(!is_sst_file_ || options.rate_limiter_priority ==
+                                  kExpectedBackupReadRateLimiterPri);
+      IOStatus rv =
+          target()->PositionedRead(offset, n, options, result, scratch, dbg);
+      return rv;
+    }
+
+   private:
+    static const Env::IOPriority kExpectedBackupReadRateLimiterPri =
+        Env::IO_LOW;
+    bool is_sst_file_;
+  };
+
   IOStatus NewSequentialFile(const std::string& f, const FileOptions& file_opts,
                              std::unique_ptr<FSSequentialFile>* r,
                              IODebugContext* dbg) override {
@@ -189,6 +223,14 @@ class TestFs : public FileSystemWrapper {
       r->reset(
           new TestFs::DummySequentialFile(dummy_sequential_file_fail_reads_));
       return IOStatus::OK();
+    } else if (check_iooptions_sequential_file_) {
+      std::unique_ptr<FSSequentialFile> file;
+      IOStatus s =
+          FileSystemWrapper::NewSequentialFile(f, file_opts, &file, dbg);
+      if (s.ok()) {
+        r->reset(new TestFs::CheckIOOptsSequentialFile(std::move(file), f));
+      }
+      return s;
     } else {
       IOStatus s = FileSystemWrapper::NewSequentialFile(f, file_opts, r, dbg);
       if (s.ok()) {
@@ -292,6 +334,11 @@ class TestFs : public FileSystemWrapper {
     dummy_sequential_file_fail_reads_ = dummy_sequential_file_fail_reads;
   }
 
+  void SetCheckIOOptionsSequentialFile(bool check_iooptions_sequential_file) {
+    MutexLock l(&mutex_);
+    check_iooptions_sequential_file_ = check_iooptions_sequential_file;
+  }
+
   void SetGetChildrenFailure(bool fail) { get_children_failure_ = fail; }
   IOStatus GetChildren(const std::string& dir, const IOOptions& io_opts,
                        std::vector<std::string>* r,
@@ -387,6 +434,7 @@ class TestFs : public FileSystemWrapper {
   port::Mutex mutex_;
   bool dummy_sequential_file_ = false;
   bool dummy_sequential_file_fail_reads_ = false;
+  bool check_iooptions_sequential_file_ = false;
   std::vector<std::string> written_files_;
   std::vector<std::string> filenames_for_mocked_attrs_;
   uint64_t limit_written_files_ = 1000000;
@@ -810,8 +858,8 @@ class BackupEngineTest : public testing::Test {
     for (auto& dir : child_dirs) {
       dir = "private/" + dir;
     }
-    child_dirs.push_back("shared");           // might not exist
-    child_dirs.push_back("shared_checksum");  // might not exist
+    child_dirs.emplace_back("shared");           // might not exist
+    child_dirs.emplace_back("shared_checksum");  // might not exist
     for (auto& dir : child_dirs) {
       std::vector<std::string> children;
       test_backup_env_->GetChildren(backupdir_ + "/" + dir, &children)
@@ -879,7 +927,7 @@ class BackupEngineTest : public testing::Test {
   void DeleteLogFiles() {
     std::vector<std::string> delete_logs;
     ASSERT_OK(db_chroot_env_->GetChildren(dbname_, &delete_logs));
-    for (auto f : delete_logs) {
+    for (const auto& f : delete_logs) {
       uint64_t number;
       FileType type;
       bool ok = ParseFileName(f, &number, &type);
@@ -1053,6 +1101,227 @@ class BackupEngineTestWithParam : public BackupEngineTest,
   }
 };
 
+TEST_F(BackupEngineTest, IncrementalRestore) {
+  // Required for excluding files.
+  engine_options_->schema_version = 2;
+
+  const int keys_iteration = 100;
+
+  options_.disable_auto_compactions = true;
+  options_.level0_file_num_compaction_trigger = 1000;
+
+  for (const auto& mode : {RestoreOptions::Mode::kPurgeAllFiles,
+                           RestoreOptions::Mode::kKeepLatestDbSessionIdFiles,
+                           RestoreOptions::Mode::kVerifyChecksum}) {
+    OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */,
+                          kShareWithChecksum);
+
+    // 1. Populate db with seed data (2 SST files, 2 blob files).
+    FillDB(db_.get(), 0, keys_iteration);
+    FillDB(db_.get(), keys_iteration, keys_iteration * 2);
+
+    std::vector<LiveFileStorageInfo> file_infos;
+    EXPECT_OK(db_->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(),
+                                           &file_infos));
+
+    std::vector<std::string> all_files;
+    std::vector<std::string> all_files_but_sst;
+    std::vector<std::string> all_sst_files;
+    std::vector<std::string> all_blob_files;
+    std::vector<std::string> all_files_but_data;
+    for (const auto& file_info : file_infos) {
+      std::string abs_file_path =
+          file_info.directory + "/" + file_info.relative_filename;
+      if (file_info.relative_filename == "CURRENT") {
+        abs_file_path += ".tmp";
+      }
+      all_files.push_back(abs_file_path);
+      if (file_info.file_type == kTableFile) {
+        all_sst_files.push_back(abs_file_path);
+      } else {
+        all_files_but_sst.push_back(abs_file_path);
+      }
+
+      if (file_info.file_type == kBlobFile) {
+        all_blob_files.push_back(abs_file_path);
+      }
+
+      if (file_info.file_type != kTableFile &&
+          file_info.file_type != kBlobFile) {
+        all_files_but_data.push_back(abs_file_path);
+      }
+    }
+
+    std::string one_sst_file = all_sst_files[0];
+
+    // 2. Verify expected behavior with exclude files feature.
+    BackupID first_id;
+    CreateBackupOptions cbo;
+    cbo.exclude_files_callback = [&one_sst_file](
+                                     MaybeExcludeBackupFile* files_begin,
+                                     MaybeExcludeBackupFile* files_end) {
+      for (auto* f = files_begin; f != files_end; ++f) {
+        std::string s = StringSplit(f->info.relative_file, '/').back();
+        s = s.substr(0, s.find('_'));
+        auto filename = one_sst_file.substr(one_sst_file.find_last_of("/") + 1);
+        if (s + ".sst" == filename) {
+          // Backup will include everything BUT that one very SST file.
+          f->exclude_decision = true;
+        } else {
+          f->exclude_decision = false;
+        }
+      }
+    };
+    ASSERT_OK(backup_engine_->CreateNewBackup(cbo, db_.get(), &first_id));
+
+    test_db_fs_->ClearWrittenFiles();
+    RestoreOptions restore_options(false, mode);
+    IOStatus io_st = backup_engine_->RestoreDBFromLatestBackup(dbname_, dbname_,
+                                                               restore_options);
+    if (mode == RestoreOptions::kKeepLatestDbSessionIdFiles) {
+      EXPECT_OK(io_st);
+      test_db_fs_->AssertWrittenFiles(all_files_but_sst);
+    } else {
+      ASSERT_TRUE(io_st.IsInvalidArgument());
+    }
+    ASSERT_OK(backup_engine_->DeleteBackup(first_id));
+
+    ASSERT_OK(backup_engine_->CreateNewBackup(db_.get()));
+    CloseDBAndBackupEngine();
+
+    DestroyDBWithoutCheck(dbname_, options_);
+
+    // 3. Verify clean restore scenario.
+    test_db_fs_->ClearWrittenFiles();
+    OpenBackupEngine();
+    ASSERT_OK(backup_engine_->RestoreDBFromLatestBackup(dbname_, dbname_,
+                                                        restore_options));
+    CloseBackupEngine();
+
+    // Since we started with a blank db, restore copied all the files.
+    test_db_fs_->AssertWrittenFiles(all_files);
+
+    db_.reset(OpenDB());
+
+    // Check DB contents.
+    AssertExists(db_.get(), 0, keys_iteration * 2);
+
+    // Create more data files. Those will be wiped out in consecutive restore.
+    FillDB(db_.get(), keys_iteration * 2, keys_iteration * 3);
+
+    db_.reset();  // CloseDB
+
+    // 4. Incremental restore - simple case.
+    //
+    // Create 'a hole' in a cleanly restored db by manually deleting data files.
+    // At this point new files were created and old files were deleted - which
+    // is representative of the users workloads.
+
+    std::string sst_file_to_be_deleted = one_sst_file;
+    std::string blob_file_to_be_deleted = all_blob_files[0];
+    IOOptions io_opts;
+    ASSERT_OK(test_db_fs_->DeleteFile(sst_file_to_be_deleted, io_opts,
+                                      nullptr /* dbg */));
+    ASSERT_OK(test_db_fs_->DeleteFile(blob_file_to_be_deleted, io_opts,
+                                      nullptr /* dbg */));
+
+    test_db_fs_->ClearWrittenFiles();
+
+    OpenBackupEngine();
+    ASSERT_OK(backup_engine_->RestoreDBFromLatestBackup(dbname_, dbname_,
+                                                        restore_options));
+    CloseBackupEngine();
+
+    std::vector<std::string> should_have_written;
+    if (mode == RestoreOptions::Mode::kPurgeAllFiles) {
+      should_have_written = all_files;
+    } else {
+      should_have_written = all_files_but_data;
+      should_have_written.emplace_back(sst_file_to_be_deleted);
+      if (mode == RestoreOptions::Mode::kKeepLatestDbSessionIdFiles) {
+        // We only support incremental restore for blobs in kVerifyChecksum
+        // mode.
+        should_have_written.insert(should_have_written.end(),
+                                   all_blob_files.begin(),
+                                   all_blob_files.end());
+      } else {
+        should_have_written.emplace_back(blob_file_to_be_deleted);
+      }
+    }
+
+    // 'Hole' has been patched, 'in-policy' db files were retained.
+    test_db_fs_->AssertWrittenFiles(should_have_written);
+
+    // Check DB contents.
+    db_.reset(OpenDB());
+    AssertExists(db_.get(), 0, keys_iteration * 2);
+
+    db_.reset();  // Close DB.
+
+    // 5. Incremental restore - corrupted db files.
+    std::string blob_file_to_be_corrupted = all_blob_files[0];
+    ASSERT_OK(db_file_manager_->CorruptFile(blob_file_to_be_corrupted, 3));
+
+    // First few bytes corruption will be detected by ReadTablePropertiesHelper
+    // at the time of reading the metadata footer. We must try a bit harder
+    // (by overriding bytes beyond the footer) to corrupt a file in a more
+    // harmful way...
+    std::string sst_file_to_be_corrupted = all_sst_files[0];
+    ASSERT_OK(db_file_manager_->CorruptFileStart(sst_file_to_be_corrupted));
+
+    OpenBackupEngine();
+
+    test_db_fs_->ClearWrittenFiles();
+    ASSERT_OK(backup_engine_->RestoreDBFromLatestBackup(dbname_, dbname_,
+                                                        restore_options));
+    CloseBackupEngine();
+    if (mode == RestoreOptions::Mode::kPurgeAllFiles) {
+      should_have_written = all_files;
+    } else {
+      should_have_written = all_files_but_data;
+      if (mode == RestoreOptions::Mode::kVerifyChecksum) {
+        // Restore running in kVerifyChecksum mode would have caught the
+        // mismatch between crc32c and db file contents. Such file would have
+        // been deleted and restored from the backup.
+        should_have_written.emplace_back(blob_file_to_be_corrupted);
+        should_have_written.emplace_back(sst_file_to_be_corrupted);
+      } else if (mode == RestoreOptions::Mode::kKeepLatestDbSessionIdFiles) {
+        // This mode is more prone to subtle db file corruptions as we do not
+        // run any CPU intensive computations (like checksum) and the match
+        // between existing db file and its' relevant backup counterpart is
+        // determined purely based on the metadata from the footer (size,
+        // db_session_id). Therefore, if corrupted portion of an existing db
+        // file does NOT directly affect those properties in the footer, it
+        // might slip through the cracks and only be detected at the time of
+        // running CRC32c.
+
+        // Separately, this mode does not support incremental restore for blobs.
+        should_have_written.insert(should_have_written.end(),
+                                   all_blob_files.begin(),
+                                   all_blob_files.end());
+      }
+    }
+
+    // 'Hole' has been patched, 'in-policy' db files were retained.
+    test_db_fs_->AssertWrittenFiles(should_have_written);
+
+    db_.reset(OpenDB());
+    Status s = db_->VerifyChecksum();
+
+    // Check DB contents.
+    if (mode == RestoreOptions::Mode::kKeepLatestDbSessionIdFiles) {
+      ASSERT_TRUE(s.IsCorruption());
+    } else {
+      EXPECT_OK(s);
+      AssertExists(db_.get(), 0, keys_iteration * 2);
+    }
+
+    db_.reset();  // Close DB.
+
+    DestroyDBWithoutCheck(dbname_, options_);
+  }
+}
+
 TEST_F(BackupEngineTest, FileCollision) {
   const int keys_iteration = 100;
   for (const auto& sopt : kAllShareOptions) {
@@ -1184,7 +1453,8 @@ TEST_P(BackupEngineTestWithParam, OnlineIntegrationTest) {
   // restore)
   // options_.db_paths.emplace_back(dbname_, 500 * 1024);
   // options_.db_paths.emplace_back(dbname_ + "_2", 1024 * 1024 * 1024);
-
+  test_db_fs_->SetCheckIOOptionsSequentialFile(true);
+  test_backup_fs_->SetCheckIOOptionsSequentialFile(true);
   OpenDBAndBackupEngine(true);
   // write some data, backup, repeat
   for (int i = 0; i < 5; ++i) {
@@ -1241,6 +1511,8 @@ TEST_P(BackupEngineTestWithParam, OnlineIntegrationTest) {
   AssertBackupConsistency(0, 0, 3 * keys_iteration, max_key);
 
   CloseBackupEngine();
+  test_db_fs_->SetCheckIOOptionsSequentialFile(false);
+  test_backup_fs_->SetCheckIOOptionsSequentialFile(false);
 }
 #endif  // !defined(ROCKSDB_VALGRIND_RUN) || defined(ROCKSDB_FULL_VALGRIND_RUN)
 
@@ -1493,7 +1765,7 @@ TEST_F(BackupEngineTest, CorruptFileMaintainSize) {
   // corrupt all the table files in shared_checksum but maintain their sizes
   OpenDBAndBackupEngine(true /* destroy_old_data */, false /* dummy */,
                         kShareWithChecksum);
-  // creat two backups
+  // create two backups
   for (int i = 1; i < 3; ++i) {
     FillDB(db_.get(), keys_iteration * i, keys_iteration * (i + 1));
     ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), true));
@@ -1710,7 +1982,7 @@ TEST_F(BackupEngineTest, TableFileWithoutDbChecksumCorruptedDuringBackup) {
       "BackupEngineImpl::CopyOrCreateFile:CorruptionDuringBackup",
       [&](void* data) {
         if (data != nullptr) {
-          Slice* d = reinterpret_cast<Slice*>(data);
+          Slice* d = static_cast<Slice*>(data);
           if (!d->empty()) {
             d->remove_suffix(1);
             corrupted = true;
@@ -1752,7 +2024,7 @@ TEST_F(BackupEngineTest, TableFileWithDbChecksumCorruptedDuringBackup) {
         "BackupEngineImpl::CopyOrCreateFile:CorruptionDuringBackup",
         [&](void* data) {
           if (data != nullptr) {
-            Slice* d = reinterpret_cast<Slice*>(data);
+            Slice* d = static_cast<Slice*>(data);
             if (!d->empty()) {
               d->remove_suffix(1);
             }
@@ -1874,7 +2146,7 @@ TEST_F(BackupEngineTest, BackupOptions) {
     ASSERT_OK(file_manager_->FileExists(OptionsPath(backupdir_, i) + name));
     ASSERT_OK(backup_chroot_env_->GetChildren(OptionsPath(backupdir_, i),
                                               &filenames));
-    for (auto fn : filenames) {
+    for (const auto& fn : filenames) {
       if (fn.compare(0, 7, "OPTIONS") == 0) {
         ASSERT_EQ(name, fn);
       }
@@ -2613,7 +2885,7 @@ TEST_F(BackupEngineTest, DeleteTmpFiles) {
           assert(false);
       }
       CloseDBAndBackupEngine();
-      for (std::string file_or_dir : tmp_files_and_dirs) {
+      for (const std::string& file_or_dir : tmp_files_and_dirs) {
         if (file_manager_->FileExists(file_or_dir) != Status::NotFound()) {
           FAIL() << file_or_dir << " was expected to be deleted." << cleanup_fn;
         }
@@ -2647,7 +2919,7 @@ class BackupEngineRateLimitingTestWithParam
                      int /* 0 = single threaded, 1 = multi threaded*/,
                      std::pair<uint64_t, uint64_t> /* limits */>> {
  public:
-  BackupEngineRateLimitingTestWithParam() {}
+  BackupEngineRateLimitingTestWithParam() = default;
 };
 
 uint64_t const MB = 1024 * 1024;
@@ -2683,12 +2955,14 @@ TEST_P(BackupEngineRateLimitingTestWithParam, RateLimiting) {
         std::make_shared<GenericRateLimiter>(
             limit.first, 100 * 1000 /* refill_period_us */, 10 /* fairness */,
             RateLimiter::Mode::kWritesOnly /* mode */,
-            special_env->GetSystemClock(), false /* auto_tuned */);
+            special_env->GetSystemClock(), false /* auto_tuned */,
+            0 /* single_burst_bytes */);
     std::shared_ptr<RateLimiter> restore_rate_limiter =
         std::make_shared<GenericRateLimiter>(
             limit.second, 100 * 1000 /* refill_period_us */, 10 /* fairness */,
             RateLimiter::Mode::kWritesOnly /* mode */,
-            special_env->GetSystemClock(), false /* auto_tuned */);
+            special_env->GetSystemClock(), false /* auto_tuned */,
+            0 /* single_burst_bytes */);
     engine_options_->backup_rate_limiter = backup_rate_limiter;
     engine_options_->restore_rate_limiter = restore_rate_limiter;
   } else {
@@ -2756,7 +3030,8 @@ TEST_P(BackupEngineRateLimitingTestWithParam, RateLimitingVerifyBackup) {
         std::make_shared<GenericRateLimiter>(
             backup_rate_limiter_limit, 100 * 1000 /* refill_period_us */,
             10 /* fairness */, RateLimiter::Mode::kAllIo /* mode */,
-            special_env->GetSystemClock(), false /* auto_tuned */);
+            special_env->GetSystemClock(), false /* auto_tuned */,
+            0 /* single_burst_bytes */);
     engine_options_->backup_rate_limiter = backup_rate_limiter;
   } else {
     engine_options_->backup_rate_limit = backup_rate_limiter_limit;
@@ -2794,7 +3069,7 @@ TEST_P(BackupEngineRateLimitingTestWithParam, RateLimitingVerifyBackup) {
                                           true /* include_file_details */));
 
   std::uint64_t bytes_read_during_verify_backup = 0;
-  for (BackupFileInfo backup_file_info : backup_info.file_details) {
+  for (const BackupFileInfo& backup_file_info : backup_info.file_details) {
     bytes_read_during_verify_backup += backup_file_info.size;
   }
   auto start_verify_backup = special_env->NowMicros();
@@ -2932,7 +3207,7 @@ class BackupEngineRateLimitingTestWithParam2
       public testing::WithParamInterface<
           std::tuple<std::pair<uint64_t, uint64_t> /* limits */>> {
  public:
-  BackupEngineRateLimitingTestWithParam2() {}
+  BackupEngineRateLimitingTestWithParam2() = default;
 };
 
 INSTANTIATE_TEST_CASE_P(
@@ -2952,7 +3227,8 @@ TEST_P(BackupEngineRateLimitingTestWithParam2,
       std::make_shared<GenericRateLimiter>(
           backup_rate_limiter_limit, 1000 * 1000 /* refill_period_us */,
           10 /* fairness */, RateLimiter::Mode::kAllIo /* mode */,
-          special_env.GetSystemClock(), false /* auto_tuned */));
+          special_env.GetSystemClock(), false /* auto_tuned */,
+          0 /* single_burst_bytes */));
 
   engine_options_->backup_rate_limiter = backup_rate_limiter;
 
@@ -2961,7 +3237,8 @@ TEST_P(BackupEngineRateLimitingTestWithParam2,
       std::make_shared<GenericRateLimiter>(
           restore_rate_limiter_limit, 1000 * 1000 /* refill_period_us */,
           10 /* fairness */, RateLimiter::Mode::kAllIo /* mode */,
-          special_env.GetSystemClock(), false /* auto_tuned */));
+          special_env.GetSystemClock(), false /* auto_tuned */,
+          0 /* single_burst_bytes */));
 
   engine_options_->restore_rate_limiter = restore_rate_limiter;
 
@@ -3906,7 +4183,7 @@ TEST_P(BackupEngineTestWithParam, BackupUsingDirectIO) {
   OpenDBAndBackupEngine(true /* destroy_old_data */);
   for (int i = 0; i < kNumBackups; ++i) {
     FillDB(db_.get(), i * kNumKeysPerBackup /* from */,
-           (i + 1) * kNumKeysPerBackup /* to */, kFlushAll);
+           (i + 1) * kNumKeysPerBackup /* to */);
 
     // Clear the file open counters and then do a bunch of backup engine ops.
     // For all ops, files should be opened in direct mode.
@@ -3948,7 +4225,7 @@ TEST_F(BackupEngineTest, BackgroundThreadCpuPriority) {
   std::atomic<CpuPriority> priority(CpuPriority::kNormal);
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "BackupEngineImpl::Initialize:SetCpuPriority", [&](void* new_priority) {
-        priority.store(*reinterpret_cast<CpuPriority*>(new_priority));
+        priority.store(*static_cast<CpuPriority*>(new_priority));
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
@@ -4128,7 +4405,7 @@ TEST_F(BackupEngineTest, FileTemperatures) {
   SetEnvsFromFileSystems();
 
   // Use temperatures
-  options_.bottommost_temperature = Temperature::kWarm;
+  options_.last_level_temperature = Temperature::kWarm;
   options_.level0_file_num_compaction_trigger = 2;
   // set dynamic_level to true so the compaction would compact the data to the
   // last level directly which will have the last_level_temperature
@@ -4156,7 +4433,7 @@ TEST_F(BackupEngineTest, FileTemperatures) {
     std::vector<LiveFileStorageInfo> infos;
     ASSERT_OK(
         db_->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(), &infos));
-    for (auto info : infos) {
+    for (const auto& info : infos) {
       if (info.file_type == kTableFile) {
         manifest_temps.emplace(info.file_number, info.temperature);
         manifest_temp_counts[info.temperature]++;
@@ -4274,168 +4551,241 @@ TEST_F(BackupEngineTest, ExcludeFiles) {
   // Need a sufficent set of file numbers
   options_.level0_file_num_compaction_trigger = 100;
 
-  OpenDBAndBackupEngine(true, false, kShareWithChecksum);
-  // Need a sufficent set of file numbers
-  const int keys_iteration = 5000;
-  FillDB(db_.get(), 0, keys_iteration / 3);
-  FillDB(db_.get(), keys_iteration / 3, keys_iteration * 2 / 3);
-  FillDB(db_.get(), keys_iteration * 2 / 3, keys_iteration);
-  CloseAndReopenDB();
+  for (const auto& restore_mode :
+       {RestoreOptions::Mode::kPurgeAllFiles,
+        RestoreOptions::Mode::kKeepLatestDbSessionIdFiles,
+        RestoreOptions::Mode::kVerifyChecksum}) {
+    OpenDBAndBackupEngine(true, false, kShareWithChecksum);
+    // Need a sufficent set of file numbers
+    const int keys_iteration = 5000;
+    FillDB(db_.get(), 0, keys_iteration / 3);
+    FillDB(db_.get(), keys_iteration / 3, keys_iteration * 2 / 3);
+    FillDB(db_.get(), keys_iteration * 2 / 3, keys_iteration);
+    CloseAndReopenDB();
 
-  BackupEngine* alt_backup_engine;
-  BackupEngineOptions alt_engine_options{*engine_options_};
-  // Use an alternate Env to test that support
-  std::string backup_alt_chroot = test::PerThreadDBPath("db_alt_backups");
-  EXPECT_OK(Env::Default()->CreateDirIfMissing(backup_alt_chroot));
-  alt_engine_options.backup_dir = "/altbk";
-  std::shared_ptr<FileSystem> alt_fs{
-      NewChrootFileSystem(FileSystem::Default(), backup_alt_chroot)};
-  std::unique_ptr<Env> alt_env{new CompositeEnvWrapper(Env::Default(), alt_fs)};
-  alt_engine_options.backup_env = alt_env.get();
+    BackupEngine* alt_backup_engine;
+    BackupEngineOptions alt_engine_options{*engine_options_};
+    // Use an alternate Env to test that support
+    std::string backup_alt_chroot = test::PerThreadDBPath("db_alt_backups");
+    EXPECT_OK(Env::Default()->CreateDirIfMissing(backup_alt_chroot));
+    alt_engine_options.backup_dir = "/altbk";
+    std::shared_ptr<FileSystem> alt_fs{
+        NewChrootFileSystem(FileSystem::Default(), backup_alt_chroot)};
+    std::unique_ptr<Env> alt_env{
+        new CompositeEnvWrapper(Env::Default(), alt_fs)};
+    alt_engine_options.backup_env = alt_env.get();
 
-  ASSERT_OK(BackupEngine::Open(test_db_env_.get(), alt_engine_options,
-                               &alt_backup_engine));
+    ASSERT_OK(BackupEngine::Open(test_db_env_.get(), alt_engine_options,
+                                 &alt_backup_engine));
 
-  // Ensure each backup is same set of files
-  db_.reset();
-  DB* db = nullptr;
-  ASSERT_OK(DB::OpenForReadOnly(options_, dbname_, &db));
+    // Ensure each backup is same set of files
+    db_.reset();
+    DB* db = nullptr;
+    ASSERT_OK(DB::OpenForReadOnly(options_, dbname_, &db));
 
-  // A callback that throws should cleanly fail the backup creation.
-  // Do this early to ensure later operations still work.
-  CreateBackupOptions cbo;
-  cbo.exclude_files_callback = [](MaybeExcludeBackupFile* /*files_begin*/,
-                                  MaybeExcludeBackupFile* /*files_end*/) {
-    throw 42;
-  };
-  ASSERT_TRUE(backup_engine_->CreateNewBackup(cbo, db).IsAborted());
-  cbo.exclude_files_callback = [](MaybeExcludeBackupFile* /*files_begin*/,
-                                  MaybeExcludeBackupFile* /*files_end*/) {
-    throw std::out_of_range("blah");
-  };
-  ASSERT_TRUE(backup_engine_->CreateNewBackup(cbo, db).IsAborted());
+    // A callback that throws should cleanly fail the backup creation.
+    // Do this early to ensure later operations still work.
+    CreateBackupOptions cbo;
+    cbo.exclude_files_callback = [](MaybeExcludeBackupFile* /*files_begin*/,
+                                    MaybeExcludeBackupFile* /*files_end*/) {
+      throw 42;
+    };
+    ASSERT_TRUE(backup_engine_->CreateNewBackup(cbo, db).IsAborted());
+    cbo.exclude_files_callback = [](MaybeExcludeBackupFile* /*files_begin*/,
+                                    MaybeExcludeBackupFile* /*files_end*/) {
+      throw std::out_of_range("blah");
+    };
+    ASSERT_TRUE(backup_engine_->CreateNewBackup(cbo, db).IsAborted());
 
-  // Include files only in given bucket, based on modulus and remainder
-  constexpr int modulus = 4;
-  int remainder = 0;
+    // Include files only in given bucket, based on modulus and remainder
+    constexpr int modulus = 4;
+    int remainder = 0;
 
-  cbo.exclude_files_callback = [&remainder](MaybeExcludeBackupFile* files_begin,
-                                            MaybeExcludeBackupFile* files_end) {
-    for (auto* f = files_begin; f != files_end; ++f) {
-      std::string s = StringSplit(f->info.relative_file, '/').back();
-      s = s.substr(0, s.find("_"));
-      int64_t num = std::strtoll(s.c_str(), nullptr, /*base*/ 10);
-      // Exclude if not a match
-      f->exclude_decision = (num % modulus) != remainder;
-    }
-  };
+    cbo.exclude_files_callback = [&remainder](
+                                     MaybeExcludeBackupFile* files_begin,
+                                     MaybeExcludeBackupFile* files_end) {
+      for (auto* f = files_begin; f != files_end; ++f) {
+        std::string s = StringSplit(f->info.relative_file, '/').back();
+        s = s.substr(0, s.find('_'));
+        int64_t num = std::strtoll(s.c_str(), nullptr, /*base*/ 10);
+        // Exclude if not a match
+        f->exclude_decision = (num % modulus) != remainder;
+      }
+    };
 
-  BackupID first_id{};
-  BackupID last_alt_id{};
-  remainder = 0;
-  ASSERT_OK(backup_engine_->CreateNewBackup(cbo, db, &first_id));
-  AssertBackupInfoConsistency(/*allow excluded*/ true);
-  remainder = 1;
-  ASSERT_OK(alt_backup_engine->CreateNewBackup(cbo, db));
-  AssertBackupInfoConsistency(/*allow excluded*/ true);
-  remainder = 2;
-  ASSERT_OK(backup_engine_->CreateNewBackup(cbo, db));
-  AssertBackupInfoConsistency(/*allow excluded*/ true);
-  remainder = 3;
-  ASSERT_OK(alt_backup_engine->CreateNewBackup(cbo, db, &last_alt_id));
-  AssertBackupInfoConsistency(/*allow excluded*/ true);
+    BackupID first_id{};
+    BackupID last_alt_id{};
+    remainder = 0;
+    ASSERT_OK(backup_engine_->CreateNewBackup(cbo, db, &first_id));
+    AssertBackupInfoConsistency(/*allow excluded*/ true);
+    remainder = 1;
+    ASSERT_OK(alt_backup_engine->CreateNewBackup(cbo, db));
+    AssertBackupInfoConsistency(/*allow excluded*/ true);
+    remainder = 2;
+    ASSERT_OK(backup_engine_->CreateNewBackup(cbo, db));
+    AssertBackupInfoConsistency(/*allow excluded*/ true);
+    remainder = 3;
+    ASSERT_OK(alt_backup_engine->CreateNewBackup(cbo, db, &last_alt_id));
+    AssertBackupInfoConsistency(/*allow excluded*/ true);
 
-  // Close DB
-  ASSERT_OK(db->Close());
-  delete db;
-  db = nullptr;
-
-  for (auto be_pair :
-       {std::make_pair(backup_engine_.get(), alt_backup_engine),
-        std::make_pair(alt_backup_engine, backup_engine_.get())}) {
-    ASSERT_OK(DestroyDB(dbname_, options_));
-    RestoreOptions ro;
-    // Fails without alternate dir
-    ASSERT_TRUE(be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro)
-                    .IsInvalidArgument());
-
-    ASSERT_OK(DestroyDB(dbname_, options_));
-    // Works with alternate dir
-    ro.alternate_dirs.push_front(be_pair.second);
-    ASSERT_OK(be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro));
-
-    // Check DB contents
-    db = OpenDB();
-    AssertExists(db, 0, keys_iteration);
+    // Close DB
+    ASSERT_OK(db->Close());
     delete db;
-  }
+    db = nullptr;
 
-  // Should still work after close and re-open
-  CloseBackupEngine();
-  OpenBackupEngine();
+    auto backup_engine = backup_engine_.get();
+    for (auto be_pair : {std::make_pair(backup_engine, alt_backup_engine),
+                         std::make_pair(alt_backup_engine, backup_engine)}) {
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      RestoreOptions ro(false /* _keep_log_files */, restore_mode);
+      // Fails without alternate dir
+      ASSERT_TRUE(be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro)
+                      .IsInvalidArgument());
 
-  for (auto be_pair :
-       {std::make_pair(backup_engine_.get(), alt_backup_engine),
-        std::make_pair(alt_backup_engine, backup_engine_.get())}) {
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      // Works with alternate dir
+      ro.alternate_dirs.push_front(be_pair.second);
+      ASSERT_OK(be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro));
+
+      // Check DB contents
+      db = OpenDB();
+      AssertExists(db, 0, keys_iteration);
+      delete db;
+    }
+
+    // Should still work after close and re-open
+    CloseBackupEngine();
+    OpenBackupEngine();
+
+    backup_engine = backup_engine_.get();
+    for (auto be_pair : {std::make_pair(backup_engine, alt_backup_engine),
+                         std::make_pair(alt_backup_engine, backup_engine)}) {
+      ASSERT_OK(DestroyDB(dbname_, options_));
+      RestoreOptions ro(false /* _keep_log_files */, restore_mode);
+      ro.alternate_dirs.push_front(be_pair.second);
+      ASSERT_OK(be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro));
+    }
+
+    // Deletion semantics are tricky when within a single backup dir one backup
+    // includes a file and the other backup excluded the file. The excluded one
+    // does not have a persistent record of metadata like file checksum, etc.
+    // Although it would be possible to amend the backup with the excluded file,
+    // that is not currently supported (unless you open the backup as read-only
+    // DB and take another backup of it). The "excluded" reference to the file
+    // is like a weak reference: it doesn't prevent the file from being deleted
+    // if all the backups with "included" references to it are deleted.
+    CloseBackupEngine();
+    OpenBackupEngine();
+
+    AssertBackupInfoConsistency(/*allow excluded*/ true);
+
+    ASSERT_OK(backup_engine_->DeleteBackup(first_id));
+    ASSERT_OK(alt_backup_engine->DeleteBackup(last_alt_id));
+
+    // Includes check for any leaked backup files
+    AssertBackupInfoConsistency(/*allow excluded*/ true);
+
+    // Excluded file(s) deleted, unable to restore
+    backup_engine = backup_engine_.get();
+    for (auto be_pair : {std::make_pair(backup_engine, alt_backup_engine),
+                         std::make_pair(alt_backup_engine, backup_engine)}) {
+      RestoreOptions ro(false /* _keep_log_files */, restore_mode);
+      ro.alternate_dirs.push_front(be_pair.second);
+      IOStatus io_st =
+          be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro);
+      if (restore_mode == RestoreOptions::Mode::kKeepLatestDbSessionIdFiles) {
+        ASSERT_OK(io_st);
+      } else {
+        ASSERT_TRUE(io_st.IsInvalidArgument());
+      }
+    }
+
+    // Close & Re-open (no crash, etc.)
+    CloseBackupEngine();
+    OpenBackupEngine();
+
+    AssertBackupInfoConsistency(/*allow excluded*/ true);
+
+    // Excluded file(s) deleted, unable to restore
+    backup_engine = backup_engine_.get();
+    for (auto be_pair : {std::make_pair(backup_engine, alt_backup_engine),
+                         std::make_pair(alt_backup_engine, backup_engine)}) {
+      RestoreOptions ro(false /* _keep_log_files */, restore_mode);
+      ro.alternate_dirs.push_front(be_pair.second);
+      IOStatus io_st =
+          be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro);
+      if (restore_mode == RestoreOptions::Mode::kKeepLatestDbSessionIdFiles) {
+        ASSERT_OK(io_st);
+      } else {
+        ASSERT_TRUE(io_st.IsInvalidArgument());
+      }
+    }
+
+    // Ensure files are not leaked after removing everything.
+    ASSERT_OK(backup_engine_->DeleteBackup(first_id + 1));
+    ASSERT_OK(alt_backup_engine->DeleteBackup(last_alt_id - 1));
+
+    // Includes check for leaked backups files
+    AssertBackupInfoConsistency(/*allow excluded*/ false);
+
+    delete alt_backup_engine;
+
     ASSERT_OK(DestroyDB(dbname_, options_));
-    RestoreOptions ro;
-    ro.alternate_dirs.push_front(be_pair.second);
-    ASSERT_OK(be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro));
   }
+}
 
-  // Deletion semantics are tricky when within a single backup dir one backup
-  // includes a file and the other backup excluded the file. The excluded one
-  // does not have a persistent record of metadata like file checksum, etc.
-  // Although it would be possible to amend the backup with the excluded file,
-  // that is not currently supported (unless you open the backup as read-only
-  // DB and take another backup of it). The "excluded" reference to the file
-  // is like a weak reference: it doesn't prevent the file from being deleted
-  // if all the backups with "included" references to it are deleted.
-  CloseBackupEngine();
-  OpenBackupEngine();
+TEST_F(BackupEngineTest, IOBufferSize) {
+  size_t expected_buffer_size = 5 * 1024 * 1024;
+  std::atomic<bool> io_buffer_size_calculated{false};
+  SyncPoint::GetInstance()->SetCallBack(
+      "BackupEngineImpl::CopyOrCreateFile:CalculateIOBufferSize",
+      [&](void* data) {
+        if (data != nullptr) {
+          EXPECT_EQ(expected_buffer_size, *static_cast<uint64_t*>(data));
+        }
+        io_buffer_size_calculated = true;
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
 
-  AssertBackupInfoConsistency(/*allow excluded*/ true);
+  const int keys_iteration = 5000;
+  Random rnd(6);
+  // With no overrides, fall back to the default buffer size of 5 MB
+  OpenDBAndBackupEngine(true /* destroy_old_data */);
+  FillDB(db_.get(), 0, keys_iteration);
+  ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), false));
+  ASSERT_TRUE(io_buffer_size_calculated);
+  CloseDBAndBackupEngine();
 
-  ASSERT_OK(backup_engine_->DeleteBackup(first_id));
-  ASSERT_OK(alt_backup_engine->DeleteBackup(last_alt_id));
+  // Override the default buffer size to 64 MB through BackupEngineOptions
+  expected_buffer_size = 64 * 1024 * 1024;
+  engine_options_->io_buffer_size = expected_buffer_size;
+  io_buffer_size_calculated = false;
+  OpenDBAndBackupEngine(true /* destroy_old_data */);
+  FillDB(db_.get(), 0, keys_iteration);
+  ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), false));
+  ASSERT_TRUE(io_buffer_size_calculated);
+  CloseDBAndBackupEngine();
 
-  // Includes check for any leaked backup files
-  AssertBackupInfoConsistency(/*allow excluded*/ true);
+  // Without io_buffer_size specified, the rate limiter burst bytes value will
+  // be used (16 MB in this example)
+  engine_options_->io_buffer_size = 0;
+  size_t single_burst_bytes = 16 * 1024 * 1024;
+  expected_buffer_size = single_burst_bytes;
+  std::shared_ptr<RateLimiter> backup_rate_limiter(NewGenericRateLimiter(
+      5 * 1024 * 1024 /* rate_bytes_per_sec */,
+      100 * 1000 /* refill_period_us */, 10 /* fairness */,
+      RateLimiter::Mode::kWritesOnly /* mode */, false /* auto_tuned */,
+      single_burst_bytes /* single_burst_bytes */));
+  engine_options_->backup_rate_limiter = backup_rate_limiter;
+  io_buffer_size_calculated = false;
+  OpenDBAndBackupEngine(true /* destroy_old_data */);
+  FillDB(db_.get(), 0, keys_iteration);
+  ASSERT_OK(backup_engine_->CreateNewBackup(db_.get(), false));
+  ASSERT_TRUE(io_buffer_size_calculated);
+  CloseDBAndBackupEngine();
 
-  // Excluded file(s) deleted, unable to restore
-  for (auto be_pair :
-       {std::make_pair(backup_engine_.get(), alt_backup_engine),
-        std::make_pair(alt_backup_engine, backup_engine_.get())}) {
-    RestoreOptions ro;
-    ro.alternate_dirs.push_front(be_pair.second);
-    ASSERT_TRUE(be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro)
-                    .IsInvalidArgument());
-  }
-
-  // Close & Re-open (no crash, etc.)
-  CloseBackupEngine();
-  OpenBackupEngine();
-
-  AssertBackupInfoConsistency(/*allow excluded*/ true);
-
-  // Excluded file(s) deleted, unable to restore
-  for (auto be_pair :
-       {std::make_pair(backup_engine_.get(), alt_backup_engine),
-        std::make_pair(alt_backup_engine, backup_engine_.get())}) {
-    RestoreOptions ro;
-    ro.alternate_dirs.push_front(be_pair.second);
-    ASSERT_TRUE(be_pair.first->RestoreDBFromLatestBackup(dbname_, dbname_, ro)
-                    .IsInvalidArgument());
-  }
-
-  // Ensure files are not leaked after removing everything.
-  ASSERT_OK(backup_engine_->DeleteBackup(first_id + 1));
-  ASSERT_OK(alt_backup_engine->DeleteBackup(last_alt_id - 1));
-
-  // Includes check for leaked backups files
-  AssertBackupInfoConsistency(/*allow excluded*/ false);
-
-  delete alt_backup_engine;
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
 }
 
 }  // namespace

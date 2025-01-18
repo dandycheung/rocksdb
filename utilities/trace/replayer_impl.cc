@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/trace/replayer_impl.h"
 
 #include <cmath>
@@ -282,8 +281,7 @@ Status ReplayerImpl::ReadTrace(Trace* trace) {
 }
 
 void ReplayerImpl::BackgroundWork(void* arg) {
-  std::unique_ptr<ReplayerWorkerArg> ra(
-      reinterpret_cast<ReplayerWorkerArg*>(arg));
+  std::unique_ptr<ReplayerWorkerArg> ra(static_cast<ReplayerWorkerArg*>(arg));
   assert(ra != nullptr);
 
   std::unique_ptr<TraceRecord> record;

@@ -6,6 +6,7 @@
 package org.rocksdb;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -77,7 +78,7 @@ public class TransactionDB extends RocksDB
       final List<ColumnFamilyDescriptor> columnFamilyDescriptors,
       final List<ColumnFamilyHandle> columnFamilyHandles)
       throws RocksDBException {
-
+    int defaultColumnFamilyIndex = -1;
     final byte[][] cfNames = new byte[columnFamilyDescriptors.size()][];
     final long[] cfOptionHandles = new long[columnFamilyDescriptors.size()];
     for (int i = 0; i < columnFamilyDescriptors.size(); i++) {
@@ -85,6 +86,13 @@ public class TransactionDB extends RocksDB
           .get(i);
       cfNames[i] = cfDescriptor.getName();
       cfOptionHandles[i] = cfDescriptor.getOptions().nativeHandle_;
+      if (Arrays.equals(cfDescriptor.getName(), RocksDB.DEFAULT_COLUMN_FAMILY)) {
+        defaultColumnFamilyIndex = i;
+      }
+    }
+    if (defaultColumnFamilyIndex < 0) {
+      throw new IllegalArgumentException(
+          "You must provide the default column family in your columnFamilyDescriptors");
     }
 
     final long[] handles = open(dbOptions.nativeHandle_,
@@ -95,12 +103,13 @@ public class TransactionDB extends RocksDB
     // in RocksDB can prevent Java to GC during the life-time of
     // the currently-created RocksDB.
     tdb.storeOptionsInstance(dbOptions);
-    tdb.storeDefaultColumnFamilyHandle(tdb.makeDefaultColumnFamilyHandle());
     tdb.storeTransactionDbOptions(transactionDbOptions);
 
     for (int i = 1; i < handles.length; i++) {
       columnFamilyHandles.add(new ColumnFamilyHandle(tdb, handles[i]));
     }
+    tdb.ownedColumnFamilyHandles.addAll(columnFamilyHandles);
+    tdb.storeDefaultColumnFamilyHandle(columnFamilyHandles.get(defaultColumnFamilyIndex));
 
     return tdb;
   }
@@ -143,6 +152,12 @@ public class TransactionDB extends RocksDB
   @SuppressWarnings("PMD.EmptyCatchBlock")
   @Override
   public void close() {
+    for (final ColumnFamilyHandle columnFamilyHandle : // NOPMD - CloseResource
+        ownedColumnFamilyHandles) {
+      columnFamilyHandle.close();
+    }
+    ownedColumnFamilyHandles.clear();
+
     if (owningHandle_.compareAndSet(true, false)) {
       try {
         closeDatabase(nativeHandle_);
@@ -379,7 +394,11 @@ public class TransactionDB extends RocksDB
     this.transactionDbOptions_ = transactionDbOptions;
   }
 
-  @Override protected final native void disposeInternal(final long handle);
+  @Override
+  protected final void disposeInternal(final long handle) {
+    disposeInternalJni(handle);
+  }
+  private static native void disposeInternalJni(final long handle);
 
   private static native long open(final long optionsHandle,
       final long transactionDbOptionsHandle, final String path)
@@ -388,21 +407,17 @@ public class TransactionDB extends RocksDB
       final long transactionDbOptionsHandle, final String path,
       final byte[][] columnFamilyNames, final long[] columnFamilyOptions);
   private static native void closeDatabase(final long handle) throws RocksDBException;
-  private native long beginTransaction(final long handle,
-      final long writeOptionsHandle);
-  private native long beginTransaction(final long handle,
-      final long writeOptionsHandle, final long transactionOptionsHandle);
-  private native long beginTransaction_withOld(final long handle,
-      final long writeOptionsHandle, final long oldTransactionHandle);
-  private native long beginTransaction_withOld(final long handle,
+  private static native long beginTransaction(final long handle, final long writeOptionsHandle);
+  private static native long beginTransaction(
+      final long handle, final long writeOptionsHandle, final long transactionOptionsHandle);
+  private static native long beginTransaction_withOld(
+      final long handle, final long writeOptionsHandle, final long oldTransactionHandle);
+  private static native long beginTransaction_withOld(final long handle,
       final long writeOptionsHandle, final long transactionOptionsHandle,
       final long oldTransactionHandle);
-  private native long getTransactionByName(final long handle,
-      final String name);
-  private native long[] getAllPreparedTransactions(final long handle);
-  private native Map<Long, KeyLockInfo> getLockStatusData(
-      final long handle);
-  private native DeadlockPath[] getDeadlockInfoBuffer(final long handle);
-  private native void setDeadlockInfoBufferSize(final long handle,
-      final int targetSize);
+  private static native long getTransactionByName(final long handle, final String name);
+  private static native long[] getAllPreparedTransactions(final long handle);
+  private static native Map<Long, KeyLockInfo> getLockStatusData(final long handle);
+  private static native DeadlockPath[] getDeadlockInfoBuffer(final long handle);
+  private static native void setDeadlockInfoBufferSize(final long handle, final int targetSize);
 }

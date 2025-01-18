@@ -19,8 +19,6 @@
 
 ROCKSDB_NAMESPACE::Env* db_stress_listener_env = nullptr;
 ROCKSDB_NAMESPACE::Env* db_stress_env = nullptr;
-// If non-null, injects read error at a rate specified by the
-// read_fault_one_in or write_fault_one_in flag
 std::shared_ptr<ROCKSDB_NAMESPACE::FaultInjectionTestFS> fault_fs_guard;
 std::shared_ptr<ROCKSDB_NAMESPACE::SecondaryCache> compressed_secondary_cache;
 std::shared_ptr<ROCKSDB_NAMESPACE::Cache> block_cache;
@@ -92,7 +90,7 @@ int64_t GetOneHotKeyID(double rand_seed, int64_t max_key) {
 
 void PoolSizeChangeThread(void* v) {
   assert(FLAGS_compaction_thread_pool_adjust_interval > 0);
-  ThreadState* thread = reinterpret_cast<ThreadState*>(v);
+  ThreadState* thread = static_cast<ThreadState*>(v);
   SharedState* shared = thread->shared;
 
   while (true) {
@@ -127,7 +125,7 @@ void PoolSizeChangeThread(void* v) {
 
 void DbVerificationThread(void* v) {
   assert(FLAGS_continuous_verification_interval > 0);
-  auto* thread = reinterpret_cast<ThreadState*>(v);
+  auto* thread = static_cast<ThreadState*>(v);
   SharedState* shared = thread->shared;
   StressTest* stress_test = shared->GetStressTest();
   assert(stress_test != nullptr);
@@ -154,7 +152,7 @@ void DbVerificationThread(void* v) {
 void CompressedCacheSetCapacityThread(void* v) {
   assert(FLAGS_compressed_secondary_cache_size > 0 ||
          FLAGS_compressed_secondary_cache_ratio > 0.0);
-  auto* thread = reinterpret_cast<ThreadState*>(v);
+  auto* thread = static_cast<ThreadState*>(v);
   SharedState* shared = thread->shared;
   while (true) {
     {
@@ -200,7 +198,7 @@ void CompressedCacheSetCapacityThread(void* v) {
         // Lower by upto 50% of usable block cache capacity
         adjustment = (adjustment * thread->rand.Uniform(50)) / 100;
         block_cache->SetCapacity(capacity - adjustment);
-        fprintf(stderr, "New cache capacity = %lu\n",
+        fprintf(stdout, "New cache capacity = %zu\n",
                 block_cache->GetCapacity());
         db_stress_env->SleepForMicroseconds(10 * 1000 * 1000);
         block_cache->SetCapacity(capacity);
@@ -210,7 +208,7 @@ void CompressedCacheSetCapacityThread(void* v) {
             (double)thread->rand.Uniform(
                 FLAGS_compressed_secondary_cache_ratio * 100) /
             100;
-        fprintf(stderr, "New comp cache ratio = %f\n", new_comp_cache_ratio);
+        fprintf(stdout, "New comp cache ratio = %f\n", new_comp_cache_ratio);
 
         s = UpdateTieredCache(block_cache, /*capacity*/ -1,
                               new_comp_cache_ratio);
@@ -321,6 +319,17 @@ uint32_t GetValueBase(Slice s) {
   return res;
 }
 
+AttributeGroups GenerateAttributeGroups(
+    const std::vector<ColumnFamilyHandle*>& cfhs, uint32_t value_base,
+    const Slice& slice) {
+  WideColumns columns = GenerateWideColumns(value_base, slice);
+  AttributeGroups attribute_groups;
+  for (auto* cfh : cfhs) {
+    attribute_groups.emplace_back(cfh, columns);
+  }
+  return attribute_groups;
+}
+
 WideColumns GenerateWideColumns(uint32_t value_base, const Slice& slice) {
   WideColumns columns;
 
@@ -384,11 +393,42 @@ bool VerifyWideColumns(const WideColumns& columns) {
   return VerifyWideColumns(value_of_default, columns);
 }
 
+bool VerifyIteratorAttributeGroups(
+    const IteratorAttributeGroups& attribute_groups) {
+  for (const auto& attribute_group : attribute_groups) {
+    if (!VerifyWideColumns(attribute_group.columns())) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::string GetNowNanos() {
   uint64_t t = db_stress_env->NowNanos();
   std::string ret;
   PutFixed64(&ret, t);
   return ret;
+}
+
+uint64_t GetWriteUnixTime(ThreadState* thread) {
+  static uint64_t kPreserveSeconds =
+      std::max(FLAGS_preserve_internal_time_seconds,
+               FLAGS_preclude_last_level_data_seconds);
+  static uint64_t kFallbackTime = std::numeric_limits<uint64_t>::max();
+  int64_t write_time = 0;
+  Status s = db_stress_env->GetCurrentTime(&write_time);
+  uint32_t write_time_mode = thread->rand.Uniform(3);
+  if (write_time_mode == 0 || !s.ok()) {
+    return kFallbackTime;
+  } else if (write_time_mode == 1) {
+    uint64_t delta = kPreserveSeconds > 0
+                         ? static_cast<uint64_t>(thread->rand.Uniform(
+                               static_cast<int>(kPreserveSeconds)))
+                         : 0;
+    return static_cast<uint64_t>(write_time) - delta;
+  } else {
+    return static_cast<uint64_t>(write_time) - kPreserveSeconds;
+  }
 }
 
 namespace {
@@ -400,7 +440,7 @@ class MyXXH64Checksum : public FileChecksumGenerator {
     XXH64_reset(state_, 0);
   }
 
-  virtual ~MyXXH64Checksum() override { XXH64_freeState(state_); }
+  ~MyXXH64Checksum() override { XXH64_freeState(state_); }
 
   void Update(const char* data, size_t n) override {
     XXH64_update(state_, data, n);

@@ -191,10 +191,9 @@ namespace {
 class SharedState {
  public:
   explicit SharedState(CacheBench* cache_bench)
-      : cv_(&mu_),
-        cache_bench_(cache_bench) {}
+      : cv_(&mu_), cache_bench_(cache_bench) {}
 
-  ~SharedState() {}
+  ~SharedState() = default;
 
   port::Mutex* GetMutex() { return &mu_; }
 
@@ -425,7 +424,7 @@ class CacheBench {
     }
   }
 
-  ~CacheBench() {}
+  ~CacheBench() = default;
 
   void PopulateCache() {
     Random64 rnd(FLAGS_seed);

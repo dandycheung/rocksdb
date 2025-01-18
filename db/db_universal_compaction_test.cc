@@ -213,7 +213,6 @@ TEST_P(DBTestUniversalCompaction, UniversalCompactionTrigger) {
   options.num_levels = num_levels_;
   options.write_buffer_size = 105 << 10;  // 105KB
   options.arena_block_size = 4 << 10;
-  options.target_file_size_base = 32 << 10;  // 32KB
   // trigger compaction if there are >= 4 files
   options.level0_file_num_compaction_trigger = 4;
   KeepFilterFactory* filter = new KeepFilterFactory(true);
@@ -2187,7 +2186,7 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompaction) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "UniversalCompactionPicker::PickPeriodicCompaction:Return",
       [&](void* arg) {
-        Compaction* compaction = reinterpret_cast<Compaction*>(arg);
+        Compaction* compaction = static_cast<Compaction*>(arg);
         ASSERT_TRUE(arg != nullptr);
         ASSERT_TRUE(compaction->compaction_reason() ==
                     CompactionReason::kPeriodicCompaction);
@@ -2258,7 +2257,7 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompactionOffpeak) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "UniversalCompactionPicker::PickPeriodicCompaction:Return",
       [&](void* arg) {
-        Compaction* compaction = reinterpret_cast<Compaction*>(arg);
+        Compaction* compaction = static_cast<Compaction*>(arg);
         ASSERT_TRUE(arg != nullptr);
         ASSERT_TRUE(compaction->compaction_reason() ==
                     CompactionReason::kPeriodicCompaction);
@@ -2369,7 +2368,6 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompactionOffpeak) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-
 
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();

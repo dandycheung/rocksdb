@@ -87,6 +87,10 @@ class WriteBatchInternal {
   static Status Put(WriteBatch* batch, uint32_t column_family_id,
                     const SliceParts& key, const SliceParts& value);
 
+  static Status TimedPut(WriteBatch* batch, uint32_t column_family_id,
+                         const Slice& key, const Slice& value,
+                         uint64_t unix_write_time);
+
   static Status PutEntity(WriteBatch* batch, uint32_t column_family_id,
                           const Slice& key, const WideColumns& columns);
 
@@ -117,6 +121,15 @@ class WriteBatchInternal {
 
   static Status PutBlobIndex(WriteBatch* batch, uint32_t column_family_id,
                              const Slice& key, const Slice& value);
+
+  static ValueType GetBeginPrepareType(bool write_after_commit,
+                                       bool unprepared_batch);
+
+  static Status InsertBeginPrepare(WriteBatch* batch,
+                                   const bool write_after_commit = true,
+                                   bool unprepared_batch = false);
+
+  static Status InsertEndPrepare(WriteBatch* batch, const Slice& xid);
 
   static Status MarkEndPrepare(WriteBatch* batch, const Slice& xid,
                                const bool write_after_commit = true,

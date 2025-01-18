@@ -106,12 +106,18 @@ TEST_F(DBPropertiesTest, Empty) {
         dbfull()->GetProperty("rocksdb.is-file-deletions-enabled", &num));
     ASSERT_EQ("0", num);
 
-    ASSERT_OK(db_->EnableFileDeletions(/*force=*/false));
+    ASSERT_OK(db_->EnableFileDeletions());
     ASSERT_TRUE(
         dbfull()->GetProperty("rocksdb.is-file-deletions-enabled", &num));
     ASSERT_EQ("0", num);
 
-    ASSERT_OK(db_->EnableFileDeletions(/*force=*/true));
+    ASSERT_OK(db_->EnableFileDeletions());
+    ASSERT_TRUE(
+        dbfull()->GetProperty("rocksdb.is-file-deletions-enabled", &num));
+    ASSERT_EQ("0", num);
+    // File deletion enabled after `EnableFileDeletions` called as many times
+    // as `DisableFileDeletions`.
+    ASSERT_OK(db_->EnableFileDeletions());
     ASSERT_TRUE(
         dbfull()->GetProperty("rocksdb.is-file-deletions-enabled", &num));
     ASSERT_EQ("1", num);
@@ -184,6 +190,49 @@ TEST_F(DBPropertiesTest, GetAggregatedIntPropertyTest) {
         DB::Properties::kEstimateTableReadersMem, &after_flush_trm));
     ASSERT_GT(after_flush_trm, before_flush_trm);
   }
+}
+
+TEST_F(DBPropertiesTest, AggregateBlockCacheProperty) {
+  constexpr size_t kCapacity = 1000;
+  LRUCacheOptions co;
+  co.capacity = kCapacity;
+  co.num_shard_bits = 0;
+  co.metadata_charge_policy = kDontChargeCacheMetadata;
+  auto block_cache = NewLRUCache(co);
+
+  // All columns families share the same block cache.
+  Options options = CurrentOptions();
+  BlockBasedTableOptions table_opt;
+  table_opt.no_block_cache = false;
+  table_opt.block_cache = block_cache;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_opt));
+
+  CreateAndReopenWithCF({"one", "two", "three", "four"}, options);
+
+  // Insert unpinned block to the cache
+  constexpr size_t kSize1 = 100;
+  ASSERT_OK(block_cache->Insert("block1", nullptr /*value*/,
+                                &kNoopCacheItemHelper, kSize1));
+  // Insert pinned block to the cache
+  constexpr size_t kSize2 = 200;
+  Cache::Handle* block2 = nullptr;
+  ASSERT_OK(block_cache->Insert("block2", nullptr /*value*/,
+                                &kNoopCacheItemHelper, kSize2, &block2));
+
+  uint64_t value;
+  ASSERT_TRUE(db_->GetAggregatedIntProperty(DB::Properties::kBlockCacheCapacity,
+                                            &value));
+  ASSERT_EQ(value, kCapacity);
+
+  ASSERT_TRUE(
+      db_->GetAggregatedIntProperty(DB::Properties::kBlockCacheUsage, &value));
+  ASSERT_EQ(value, kSize1 + kSize2);
+
+  ASSERT_TRUE(db_->GetAggregatedIntProperty(
+      DB::Properties::kBlockCachePinnedUsage, &value));
+  ASSERT_EQ(value, kSize2);
+
+  block_cache->Release(block2);
 }
 
 namespace {
@@ -1077,7 +1126,6 @@ TEST_F(DBPropertiesTest, EstimateCompressionRatio) {
   ASSERT_GT(CompressionRatioAtLevel(1), 10.0);
 }
 
-
 class CountingUserTblPropCollector : public TablePropertiesCollector {
  public:
   const char* Name() const override { return "CountingUserTblPropCollector"; }
@@ -1743,7 +1791,7 @@ TEST_F(DBPropertiesTest, SstFilesSize) {
   ASSERT_EQ(obsolete_sst_size, sst_size);
 
   // Let the obsolete files be deleted.
-  ASSERT_OK(db_->EnableFileDeletions(/*force=*/false));
+  ASSERT_OK(db_->EnableFileDeletions());
   ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kObsoleteSstFilesSize,
                                   &obsolete_sst_size));
   ASSERT_EQ(obsolete_sst_size, 0);
@@ -2359,7 +2407,6 @@ TEST_F(DBPropertiesTest, TableMetaIndexKeys) {
     EXPECT_EQ("NOT_FOUND", PopMetaIndexKey(meta_iter.get()));
   } while (ChangeOptions());
 }
-
 
 }  // namespace ROCKSDB_NAMESPACE
 

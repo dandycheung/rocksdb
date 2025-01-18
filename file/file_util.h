@@ -20,27 +20,25 @@
 namespace ROCKSDB_NAMESPACE {
 // use_fsync maps to options.use_fsync, which determines the way that
 // the file is synced after copying.
-extern IOStatus CopyFile(FileSystem* fs, const std::string& source,
-                         std::unique_ptr<WritableFileWriter>& dest_writer,
-                         uint64_t size, bool use_fsync,
-                         const std::shared_ptr<IOTracer>& io_tracer,
-                         const Temperature temperature);
-extern IOStatus CopyFile(FileSystem* fs, const std::string& source,
-                         const std::string& destination, uint64_t size,
-                         bool use_fsync,
-                         const std::shared_ptr<IOTracer>& io_tracer,
-                         const Temperature temperature);
+IOStatus CopyFile(FileSystem* fs, const std::string& source,
+                  Temperature src_temp_hint,
+                  std::unique_ptr<WritableFileWriter>& dest_writer,
+                  uint64_t size, bool use_fsync,
+                  const std::shared_ptr<IOTracer>& io_tracer);
+IOStatus CopyFile(FileSystem* fs, const std::string& source,
+                  Temperature src_temp_hint, const std::string& destination,
+                  Temperature dst_temp, uint64_t size, bool use_fsync,
+                  const std::shared_ptr<IOTracer>& io_tracer);
 inline IOStatus CopyFile(const std::shared_ptr<FileSystem>& fs,
-                         const std::string& source,
-                         const std::string& destination, uint64_t size,
-                         bool use_fsync,
-                         const std::shared_ptr<IOTracer>& io_tracer,
-                         const Temperature temperature) {
-  return CopyFile(fs.get(), source, destination, size, use_fsync, io_tracer,
-                  temperature);
+                         const std::string& source, Temperature src_temp_hint,
+                         const std::string& destination, Temperature dst_temp,
+                         uint64_t size, bool use_fsync,
+                         const std::shared_ptr<IOTracer>& io_tracer) {
+  return CopyFile(fs.get(), source, src_temp_hint, destination, dst_temp, size,
+                  use_fsync, io_tracer);
 }
-extern IOStatus CreateFile(FileSystem* fs, const std::string& destination,
-                           const std::string& contents, bool use_fsync);
+IOStatus CreateFile(FileSystem* fs, const std::string& destination,
+                    const std::string& contents, bool use_fsync);
 
 inline IOStatus CreateFile(const std::shared_ptr<FileSystem>& fs,
                            const std::string& destination,
@@ -48,13 +46,27 @@ inline IOStatus CreateFile(const std::shared_ptr<FileSystem>& fs,
   return CreateFile(fs.get(), destination, contents, use_fsync);
 }
 
-extern Status DeleteDBFile(const ImmutableDBOptions* db_options,
-                           const std::string& fname,
-                           const std::string& path_to_sync, const bool force_bg,
-                           const bool force_fg);
+// Delete a DB file, if this file is a SST file or Blob file and SstFileManager
+// is used, it should have already been tracked by SstFileManager via its
+// `OnFileAdd` API before passing to this API to be deleted, to ensure
+// SstFileManager and its DeleteScheduler are tracking DB size and trash size
+// properly.
+Status DeleteDBFile(const ImmutableDBOptions* db_options,
+                    const std::string& fname, const std::string& path_to_sync,
+                    const bool force_bg, const bool force_fg);
+
+// Delete an unaccounted DB file that is not tracked by SstFileManager and will
+// not be tracked by its DeleteScheduler when getting deleted.
+// If a legitimate bucket is provided and this file is scheduled for slow
+// deletion, it will be assigned to the specified trash bucket.
+Status DeleteUnaccountedDBFile(const ImmutableDBOptions* db_options,
+                               const std::string& fname,
+                               const std::string& dir_to_sync,
+                               const bool force_bg, const bool force_fg,
+                               std::optional<int32_t> bucket);
 
 // TODO(hx235): pass the whole DBOptions intead of its individual fields
-extern IOStatus GenerateOneFileChecksum(
+IOStatus GenerateOneFileChecksum(
     FileSystem* fs, const std::string& file_path,
     FileChecksumGenFactory* checksum_factory,
     const std::string& requested_checksum_func_name, std::string* file_checksum,

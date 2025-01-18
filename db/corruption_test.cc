@@ -7,8 +7,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include "rocksdb/options.h"
-
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -25,6 +23,7 @@
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/options.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "rocksdb/write_batch.h"
@@ -53,10 +52,9 @@ class ErrorFS : public FileSystemWrapper {
         num_writable_file_errors_(0) {}
   const char* Name() const override { return "ErrorEnv"; }
 
-  virtual IOStatus NewWritableFile(const std::string& fname,
-                                   const FileOptions& opts,
-                                   std::unique_ptr<FSWritableFile>* result,
-                                   IODebugContext* dbg) override {
+  IOStatus NewWritableFile(const std::string& fname, const FileOptions& opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
     result->reset();
     if (writable_file_error_) {
       ++num_writable_file_errors_;
@@ -823,7 +821,6 @@ TEST_F(CorruptionTest, ParanoidFileChecksOnFlush) {
   Options options;
   options.level_compaction_dynamic_level_bytes = false;
   options.env = env_.get();
-  options.check_flush_compaction_key_order = false;
   options.paranoid_file_checks = true;
   options.create_if_missing = true;
   Status s;
@@ -854,7 +851,6 @@ TEST_F(CorruptionTest, ParanoidFileChecksOnCompact) {
   options.env = env_.get();
   options.paranoid_file_checks = true;
   options.create_if_missing = true;
-  options.check_flush_compaction_key_order = false;
   Status s;
   for (const auto& mode : corruption_modes) {
     delete db_;
@@ -886,7 +882,6 @@ TEST_F(CorruptionTest, ParanoidFileChecksWithDeleteRangeFirst) {
   Options options;
   options.level_compaction_dynamic_level_bytes = false;
   options.env = env_.get();
-  options.check_flush_compaction_key_order = false;
   options.paranoid_file_checks = true;
   options.create_if_missing = true;
   for (bool do_flush : {true, false}) {
@@ -923,7 +918,6 @@ TEST_F(CorruptionTest, ParanoidFileChecksWithDeleteRange) {
   Options options;
   options.level_compaction_dynamic_level_bytes = false;
   options.env = env_.get();
-  options.check_flush_compaction_key_order = false;
   options.paranoid_file_checks = true;
   options.create_if_missing = true;
   for (bool do_flush : {true, false}) {
@@ -963,7 +957,6 @@ TEST_F(CorruptionTest, ParanoidFileChecksWithDeleteRangeLast) {
   Options options;
   options.level_compaction_dynamic_level_bytes = false;
   options.env = env_.get();
-  options.check_flush_compaction_key_order = false;
   options.paranoid_file_checks = true;
   options.create_if_missing = true;
   for (bool do_flush : {true, false}) {
@@ -1032,7 +1025,6 @@ TEST_F(CorruptionTest, CompactionKeyOrderCheck) {
   options.env = env_.get();
   options.paranoid_file_checks = false;
   options.create_if_missing = true;
-  options.check_flush_compaction_key_order = false;
   delete db_;
   db_ = nullptr;
   ASSERT_OK(DestroyDB(dbname_, options));
@@ -1047,7 +1039,6 @@ TEST_F(CorruptionTest, CompactionKeyOrderCheck) {
   ASSERT_OK(dbi->TEST_FlushMemTable());
 
   mock->SetCorruptionMode(mock::MockTableFactory::kCorruptNone);
-  ASSERT_OK(db_->SetOptions({{"check_flush_compaction_key_order", "true"}}));
   CompactRangeOptions cro;
   cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
   ASSERT_NOK(
@@ -1060,7 +1051,6 @@ TEST_F(CorruptionTest, FlushKeyOrderCheck) {
   options.env = env_.get();
   options.paranoid_file_checks = false;
   options.create_if_missing = true;
-  ASSERT_OK(db_->SetOptions({{"check_flush_compaction_key_order", "true"}}));
 
   ASSERT_OK(db_->Put(WriteOptions(), "foo1", "v1"));
   ASSERT_OK(db_->Put(WriteOptions(), "foo2", "v1"));
@@ -1081,28 +1071,6 @@ TEST_F(CorruptionTest, FlushKeyOrderCheck) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
   Status s = static_cast_with_check<DBImpl>(db_)->TEST_FlushMemTable();
   ASSERT_NOK(s);
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
-}
-
-TEST_F(CorruptionTest, DisableKeyOrderCheck) {
-  ASSERT_OK(db_->SetOptions({{"check_flush_compaction_key_order", "false"}}));
-  DBImpl* dbi = static_cast_with_check<DBImpl>(db_);
-
-  SyncPoint::GetInstance()->SetCallBack(
-      "OutputValidator::Add:order_check",
-      [&](void* /*arg*/) { ASSERT_TRUE(false); });
-  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
-  ASSERT_OK(db_->Put(WriteOptions(), "foo1", "v1"));
-  ASSERT_OK(db_->Put(WriteOptions(), "foo3", "v1"));
-  ASSERT_OK(dbi->TEST_FlushMemTable());
-  ASSERT_OK(db_->Put(WriteOptions(), "foo2", "v1"));
-  ASSERT_OK(db_->Put(WriteOptions(), "foo4", "v1"));
-  ASSERT_OK(dbi->TEST_FlushMemTable());
-  CompactRangeOptions cro;
-  cro.bottommost_level_compaction = BottommostLevelCompaction::kForce;
-  ASSERT_OK(
-      dbi->CompactRange(cro, dbi->DefaultColumnFamily(), nullptr, nullptr));
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
 }
@@ -1133,7 +1101,7 @@ TEST_F(CorruptionTest, VerifyWholeTableChecksum) {
   int count{0};
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::VerifyFullFileChecksum:mismatch", [&](void* arg) {
-        auto* s = reinterpret_cast<Status*>(arg);
+        auto* s = static_cast<Status*>(arg);
         ASSERT_NE(s, nullptr);
         ++count;
         ASSERT_NOK(*s);
@@ -1278,7 +1246,7 @@ TEST_P(CrashDuringRecoveryWithCorruptionTest, CrashDuringRecovery) {
     SyncPoint::GetInstance()->ClearAllCallBacks();
     SyncPoint::GetInstance()->SetCallBack(
         "DBImpl::GetLogSizeAndMaybeTruncate:0", [&](void* arg) {
-          auto* tmp_s = reinterpret_cast<Status*>(arg);
+          auto* tmp_s = static_cast<Status*>(arg);
           assert(tmp_s);
           *tmp_s = Status::IOError("Injected");
         });
@@ -1460,7 +1428,7 @@ TEST_P(CrashDuringRecoveryWithCorruptionTest, TxnDbCrashDuringRecovery) {
     SyncPoint::GetInstance()->ClearAllCallBacks();
     SyncPoint::GetInstance()->SetCallBack(
         "DBImpl::Open::BeforeSyncWAL", [&](void* arg) {
-          auto* tmp_s = reinterpret_cast<Status*>(arg);
+          auto* tmp_s = static_cast<Status*>(arg);
           assert(tmp_s);
           *tmp_s = Status::IOError("Injected");
         });
@@ -1628,7 +1596,7 @@ TEST_P(CrashDuringRecoveryWithCorruptionTest, CrashDuringRecoveryWithFlush) {
     SyncPoint::GetInstance()->ClearAllCallBacks();
     SyncPoint::GetInstance()->SetCallBack(
         "DBImpl::GetLogSizeAndMaybeTruncate:0", [&](void* arg) {
-          auto* tmp_s = reinterpret_cast<Status*>(arg);
+          auto* tmp_s = static_cast<Status*>(arg);
           assert(tmp_s);
           *tmp_s = Status::IOError("Injected");
         });

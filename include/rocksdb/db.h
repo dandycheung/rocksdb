@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "rocksdb/attribute_groups.h"
 #include "rocksdb/block_cache_trace_writer.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/listener.h"
@@ -27,13 +28,10 @@
 #include "rocksdb/thread_status.h"
 #include "rocksdb/transaction_log.h"
 #include "rocksdb/types.h"
+#include "rocksdb/user_write_callback.h"
+#include "rocksdb/utilities/table_properties_collectors.h"
 #include "rocksdb/version.h"
 #include "rocksdb/wide_columns.h"
-
-#ifdef _WIN32
-// Windows API macro interference
-#undef DeleteFile
-#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #define ROCKSDB_DEPRECATED_FUNC __attribute__((__deprecated__))
@@ -131,16 +129,31 @@ struct IngestExternalFileArg {
   IngestExternalFileOptions options;
   std::vector<std::string> files_checksums;
   std::vector<std::string> files_checksum_func_names;
+  // A hint as to the temperature for *reading* the files to be ingested.
   Temperature file_temperature = Temperature::kUnknown;
 };
 
 struct GetMergeOperandsOptions {
+  using ContinueCallback = std::function<bool(Slice)>;
+
   // A limit on the number of merge operands returned by the GetMergeOperands()
   // API. In contrast with ReadOptions::merge_operator_max_count, this is a hard
   // limit: when it is exceeded, no merge operands will be returned and the
   // query will fail with an Incomplete status. See also the
   // DB::GetMergeOperands() API below.
   int expected_max_number_of_operands = 0;
+
+  // `continue_cb` will be called after reading each merge operand, excluding
+  // any base value. Operands are read in order from newest to oldest. The
+  // operand value is provided as an argument.
+  //
+  // Returning false will end the lookup process at the merge operand on which
+  // `continue_cb` was just invoked. Returning true allows the lookup to
+  // continue.
+  //
+  // If it is nullptr, `GetMergeOperands()` will behave as if it always returned
+  // true (continue fetching merge operands until there are no more).
+  ContinueCallback continue_cb;
 };
 
 // A collections of table properties objects, where
@@ -166,7 +179,15 @@ class DB {
   //
   // Caller must delete *dbptr when it is no longer needed.
   static Status Open(const Options& options, const std::string& name,
-                     DB** dbptr);
+                     std::unique_ptr<DB>* dbptr);
+  // DEPRECATED: raw pointer variant
+  static Status Open(const Options& options, const std::string& name,
+                     DB** dbptr) {
+    std::unique_ptr<DB> smart_ptr;
+    Status s = Open(options, name, &smart_ptr);
+    *dbptr = smart_ptr.release();
+    return s;
+  }
 
   // Open DB with column families.
   // db_options specify database specific options
@@ -184,7 +205,17 @@ class DB {
   // DestroyColumnFamilyHandle() with all the handles.
   static Status Open(const DBOptions& db_options, const std::string& name,
                      const std::vector<ColumnFamilyDescriptor>& column_families,
-                     std::vector<ColumnFamilyHandle*>* handles, DB** dbptr);
+                     std::vector<ColumnFamilyHandle*>* handles,
+                     std::unique_ptr<DB>* dbptr);
+  // DEPRECATED: raw pointer variant
+  static Status Open(const DBOptions& db_options, const std::string& name,
+                     const std::vector<ColumnFamilyDescriptor>& column_families,
+                     std::vector<ColumnFamilyHandle*>* handles, DB** dbptr) {
+    std::unique_ptr<DB> smart_ptr;
+    Status s = Open(db_options, name, column_families, handles, &smart_ptr);
+    *dbptr = smart_ptr.release();
+    return s;
+  }
 
   // OpenForReadOnly() creates a Read-only instance that supports reads alone.
   //
@@ -201,8 +232,18 @@ class DB {
   // Open the database for read only.
   //
   static Status OpenForReadOnly(const Options& options, const std::string& name,
-                                DB** dbptr,
+                                std::unique_ptr<DB>* dbptr,
                                 bool error_if_wal_file_exists = false);
+  // DEPRECATED: raw pointer variant
+  static Status OpenForReadOnly(const Options& options, const std::string& name,
+                                DB** dbptr,
+                                bool error_if_wal_file_exists = false) {
+    std::unique_ptr<DB> smart_ptr;
+    Status s =
+        OpenForReadOnly(options, name, &smart_ptr, error_if_wal_file_exists);
+    *dbptr = smart_ptr.release();
+    return s;
+  }
 
   // Open the database for read only with column families.
   //
@@ -214,8 +255,20 @@ class DB {
   static Status OpenForReadOnly(
       const DBOptions& db_options, const std::string& name,
       const std::vector<ColumnFamilyDescriptor>& column_families,
-      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+      std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
       bool error_if_wal_file_exists = false);
+  // DEPRECATED: raw pointer variant
+  static Status OpenForReadOnly(
+      const DBOptions& db_options, const std::string& name,
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+      bool error_if_wal_file_exists = false) {
+    std::unique_ptr<DB> smart_ptr;
+    Status s = OpenForReadOnly(db_options, name, column_families, handles,
+                               &smart_ptr, error_if_wal_file_exists);
+    *dbptr = smart_ptr.release();
+    return s;
+  }
 
   // OpenAsSecondary() creates a secondary instance that supports read-only
   // operations and supports dynamic catch up with the primary (through a
@@ -242,7 +295,16 @@ class DB {
   //
   // Return OK on success, non-OK on failures.
   static Status OpenAsSecondary(const Options& options, const std::string& name,
-                                const std::string& secondary_path, DB** dbptr);
+                                const std::string& secondary_path,
+                                std::unique_ptr<DB>* dbptr);
+  // DEPRECATED: raw pointer variant
+  static Status OpenAsSecondary(const Options& options, const std::string& name,
+                                const std::string& secondary_path, DB** dbptr) {
+    std::unique_ptr<DB> smart_ptr;
+    Status s = OpenAsSecondary(options, name, secondary_path, &smart_ptr);
+    *dbptr = smart_ptr.release();
+    return s;
+  }
 
   // Open DB as secondary instance with specified column families
   //
@@ -280,7 +342,42 @@ class DB {
       const DBOptions& db_options, const std::string& name,
       const std::string& secondary_path,
       const std::vector<ColumnFamilyDescriptor>& column_families,
-      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr);
+      std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr);
+  // DEPRECATED: raw pointer variant
+  static Status OpenAsSecondary(
+      const DBOptions& db_options, const std::string& name,
+      const std::string& secondary_path,
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr) {
+    std::unique_ptr<DB> smart_ptr;
+    Status s = OpenAsSecondary(db_options, name, secondary_path,
+                               column_families, handles, &smart_ptr);
+    *dbptr = smart_ptr.release();
+    return s;
+  }
+
+  // EXPERIMENTAL
+
+  // Open a database as a follower. The difference between this and opening
+  // as secondary is that the follower database has its own directory with
+  // links to the actual files, and can tolarate obsolete file deletions by
+  // the leader to its own database. Another difference is the follower
+  // tries to keep up with the leader by periodically tailing the leader's
+  // MANIFEST, and (in the future) memtable updates, rather than relying on
+  // the user to manually call TryCatchupWithPrimary().
+
+  // Open as a follower with the default column family
+  static Status OpenAsFollower(const Options& options, const std::string& name,
+                               const std::string& leader_path,
+                               std::unique_ptr<DB>* dbptr);
+
+  // Open as a follower with multiple column families
+  static Status OpenAsFollower(
+      const DBOptions& db_options, const std::string& name,
+      const std::string& leader_path,
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr);
+  // End EXPERIMENTAL
 
   // Open DB and run the compaction.
   // It's a read-only operation, the result won't be installed to the DB, it
@@ -308,8 +405,20 @@ class DB {
   static Status OpenAndTrimHistory(
       const DBOptions& db_options, const std::string& dbname,
       const std::vector<ColumnFamilyDescriptor>& column_families,
-      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+      std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
       std::string trim_ts);
+  // DEPRECATED: raw pointer variant
+  static Status OpenAndTrimHistory(
+      const DBOptions& db_options, const std::string& dbname,
+      const std::vector<ColumnFamilyDescriptor>& column_families,
+      std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+      std::string trim_ts) {
+    std::unique_ptr<DB> smart_ptr;
+    Status s = OpenAndTrimHistory(db_options, dbname, column_families, handles,
+                                  &smart_ptr, trim_ts);
+    *dbptr = smart_ptr.release();
+    return s;
+  }
 
   // Manually, synchronously attempt to resume DB writes after a write failure
   // to the underlying filesystem. See
@@ -502,6 +611,8 @@ class DB {
   // 2) Limiting the maximum number of open files in the presence of range
   // tombstones can degrade read performance. To avoid this problem, set
   // max_open_files to -1 whenever possible.
+  // 3) Incompatible with row_cache, will return Status::NotSupported() if
+  // row_cache is configured.
   virtual Status DeleteRange(const WriteOptions& options,
                              ColumnFamilyHandle* column_family,
                              const Slice& begin_key, const Slice& end_key);
@@ -542,6 +653,15 @@ class DB {
   // Note: consider setting options.sync = true.
   virtual Status Write(const WriteOptions& options, WriteBatch* updates) = 0;
 
+  // Same as DB::Write, and takes a `UserWriteCallback` argument to allow
+  // users to plug in custom logic in callback functions during the write.
+  virtual Status WriteWithCallback(const WriteOptions& /*options*/,
+                                   WriteBatch* /*updates*/,
+                                   UserWriteCallback* /*user_write_cb*/) {
+    return Status::NotSupported(
+        "WriteWithCallback not implemented for this interface.");
+  }
+
   // If the column family specified by "column_family" contains an entry for
   // "key", return the corresponding value in "*value". If the entry is a plain
   // key-value, return the value as-is; if it is a wide-column entity, return
@@ -549,35 +669,23 @@ class DB {
   // any, or an empty value otherwise.
   //
   // If timestamp is enabled and a non-null timestamp pointer is passed in,
-  // timestamp is returned.
+  // timestamp is returned. If the underlying DB implementation doesn't
+  // support returning timestamp and the timestamp argument is non-null,
+  // a Status::NotSupported() error will be returned.
   //
   // Returns OK on success. Returns NotFound and an empty value in "*value" if
   // there is no entry for "key". Returns some other non-OK status on error.
-  virtual inline Status Get(const ReadOptions& options,
-                            ColumnFamilyHandle* column_family, const Slice& key,
-                            std::string* value) {
-    assert(value != nullptr);
-    PinnableSlice pinnable_val(value);
-    assert(!pinnable_val.IsPinned());
-    auto s = Get(options, column_family, key, &pinnable_val);
-    if (s.ok() && pinnable_val.IsPinned()) {
-      value->assign(pinnable_val.data(), pinnable_val.size());
-    }  // else value is already assigned
-    return s;
-  }
+  // NOTE: Pure virtual => was virtual before
   virtual Status Get(const ReadOptions& options,
                      ColumnFamilyHandle* column_family, const Slice& key,
-                     PinnableSlice* value) = 0;
-  virtual Status Get(const ReadOptions& options, const Slice& key,
-                     std::string* value) {
-    return Get(options, DefaultColumnFamily(), key, value);
-  }
+                     PinnableSlice* value, std::string* timestamp) = 0;
 
-  // Get() methods that return timestamp. Derived DB classes don't need to worry
-  // about this group of methods if they don't care about timestamp feature.
+  // The timestamp of the key is returned if a non-null timestamp pointer is
+  // passed, and value is returned as a string
+  // NOTE: virtual final => disallow override (was previously allowed)
   virtual inline Status Get(const ReadOptions& options,
                             ColumnFamilyHandle* column_family, const Slice& key,
-                            std::string* value, std::string* timestamp) {
+                            std::string* value, std::string* timestamp) final {
     assert(value != nullptr);
     PinnableSlice pinnable_val(value);
     assert(!pinnable_val.IsPinned());
@@ -587,15 +695,43 @@ class DB {
     }  // else value is already assigned
     return s;
   }
-  virtual Status Get(const ReadOptions& /*options*/,
-                     ColumnFamilyHandle* /*column_family*/,
-                     const Slice& /*key*/, PinnableSlice* /*value*/,
-                     std::string* /*timestamp*/) {
-    return Status::NotSupported(
-        "Get() that returns timestamp is not implemented.");
+
+  // No timestamp, and value is returned in a PinnableSlice
+  // NOTE: virtual final => disallow override (was previously allowed)
+  virtual Status Get(const ReadOptions& options,
+                     ColumnFamilyHandle* column_family, const Slice& key,
+                     PinnableSlice* value) final {
+    return Get(options, column_family, key, value, nullptr);
   }
+
+  // No timestamp, and the value is returned as a string
+  // NOTE: virtual final => disallow override (was previously allowed)
+  virtual inline Status Get(const ReadOptions& options,
+                            ColumnFamilyHandle* column_family, const Slice& key,
+                            std::string* value) final {
+    assert(value != nullptr);
+    PinnableSlice pinnable_val(value);
+    assert(!pinnable_val.IsPinned());
+    auto s = Get(options, column_family, key, &pinnable_val);
+    if (s.ok() && pinnable_val.IsPinned()) {
+      value->assign(pinnable_val.data(), pinnable_val.size());
+    }  // else value is already assigned
+    return s;
+  }
+
+  // Gets a key in the default column family, returns the value as a string,
+  // and no timestamp returned
+  // NOTE: virtual final => disallow override (was previously allowed)
   virtual Status Get(const ReadOptions& options, const Slice& key,
-                     std::string* value, std::string* timestamp) {
+                     std::string* value) final {
+    return Get(options, DefaultColumnFamily(), key, value);
+  }
+
+  // Gets a key in the default column family, returns the value as a string,
+  // and timestamp of the key is returned if timestamp parameter is non-null
+  // NOTE: virtual final => disallow override (was previously allowed)
+  virtual Status Get(const ReadOptions& options, const Slice& key,
+                     std::string* value, std::string* timestamp) final {
     return Get(options, DefaultColumnFamily(), key, value, timestamp);
   }
 
@@ -626,11 +762,12 @@ class DB {
   }
 
   // Populates the `merge_operands` array with all the merge operands in the DB
-  // for `key`. The `merge_operands` array will be populated in the order of
-  // insertion. The number of entries populated in `merge_operands` will be
-  // assigned to `*number_of_operands`.
+  // for `key`, or a customizable suffix of merge operands when
+  // `GetMergeOperandsOptions::continue_cb` is set. The `merge_operands` array
+  // will be populated in the order of insertion. The number of entries
+  // populated in `merge_operands` will be assigned to `*number_of_operands`.
   //
-  // If the number of merge operands in DB for `key` is greater than
+  // If the number of merge operands to return for `key` is greater than
   // `merge_operands_options.expected_max_number_of_operands`,
   // `merge_operands` is not populated and the return value is
   // `Status::Incomplete`. In that case, `*number_of_operands` will be assigned
@@ -650,9 +787,10 @@ class DB {
       int* number_of_operands) = 0;
 
   // Consistent Get of many keys across column families without the need
-  // for an explicit snapshot. NOTE: the implementation of this MultiGet API
-  // does not have the performance benefits of the void-returning MultiGet
-  // functions.
+  // for an explicit snapshot. The main difference between this set of
+  // MultiGet APis and the batched MultiGet APIs that follow are -
+  // 1. The APIs take std::vector instead of C style array pointers
+  // 2. Values are returned as std::string rather than PinnableSlice
   //
   // If keys[i] does not exist in the database, then the i'th returned
   // status will be one for which Status::IsNotFound() is true, and
@@ -662,34 +800,67 @@ class DB {
   //
   // (*values) will always be resized to be the same size as (keys).
   // Similarly, the number of returned statuses will be the number of keys.
+  // If timestamps is non-null, the vector pointed to by it will be resized to
+  // number of keys and filled with timestamps of the keys on return.
   // Note: keys will not be "de-duplicated". Duplicate keys will return
-  // duplicate values in order.
+  // duplicate values in order, and may return different status values
+  // in case there are errors.
+  // NOTE: virtual final => disallow override (was previously allowed)
+  virtual std::vector<Status> MultiGet(
+      const ReadOptions& options,
+      const std::vector<ColumnFamilyHandle*>& column_families,
+      const std::vector<Slice>& keys, std::vector<std::string>* values,
+      std::vector<std::string>* timestamps) final {
+    size_t num_keys = keys.size();
+    std::vector<Status> statuses(num_keys);
+    std::vector<PinnableSlice> pin_values(num_keys);
+
+    values->resize(num_keys);
+    if (timestamps) {
+      timestamps->resize(num_keys);
+    }
+    MultiGet(options, num_keys,
+             const_cast<ColumnFamilyHandle**>(column_families.data()),
+             keys.data(), pin_values.data(),
+             timestamps ? timestamps->data() : nullptr, statuses.data(),
+             /*sorted_input=*/false);
+    for (size_t i = 0; i < num_keys; ++i) {
+      if (statuses[i].ok()) {
+        (*values)[i].assign(pin_values[i].data(), pin_values[i].size());
+      }
+    }
+    return statuses;
+  }
+
+  // No timestamps are returned
+  // NOTE: virtual final => disallow override (was previously allowed)
   virtual std::vector<Status> MultiGet(
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_family,
-      const std::vector<Slice>& keys, std::vector<std::string>* values) = 0;
+      const std::vector<Slice>& keys, std::vector<std::string>* values) final {
+    values->resize(keys.size());
+    return MultiGet(options, column_family, keys, values, nullptr);
+  }
+
+  // MultiGet for default column family, no timestamps returned
+  // NOTE: virtual final => disallow override (was previously allowed)
   virtual std::vector<Status> MultiGet(const ReadOptions& options,
                                        const std::vector<Slice>& keys,
-                                       std::vector<std::string>* values) {
+                                       std::vector<std::string>* values) final {
+    values->resize(keys.size());
     return MultiGet(
         options,
         std::vector<ColumnFamilyHandle*>(keys.size(), DefaultColumnFamily()),
         keys, values);
   }
 
+  // MultiGet for default column family
+  // NOTE: virtual final => disallow override (was previously allowed)
   virtual std::vector<Status> MultiGet(
-      const ReadOptions& /*options*/,
-      const std::vector<ColumnFamilyHandle*>& /*column_family*/,
-      const std::vector<Slice>& keys, std::vector<std::string>* /*values*/,
-      std::vector<std::string>* /*timestamps*/) {
-    return std::vector<Status>(
-        keys.size(), Status::NotSupported(
-                         "MultiGet() returning timestamps not implemented."));
-  }
-  virtual std::vector<Status> MultiGet(const ReadOptions& options,
-                                       const std::vector<Slice>& keys,
-                                       std::vector<std::string>* values,
-                                       std::vector<std::string>* timestamps) {
+      const ReadOptions& options, const std::vector<Slice>& keys,
+      std::vector<std::string>* values,
+      std::vector<std::string>* timestamps) final {
+    values->resize(keys.size());
     return MultiGet(
         options,
         std::vector<ColumnFamilyHandle*>(keys.size(), DefaultColumnFamily()),
@@ -704,123 +875,59 @@ class DB {
   // benefits.
   // Parameters -
   // options - ReadOptions
-  // column_family - ColumnFamilyHandle* that the keys belong to. All the keys
-  //                 passed to the API are restricted to a single column family
   // num_keys - Number of keys to lookup
+  // column_families - Pointer to C style array of ColumnFamilyHandle* that
+  //                   the keys belong to.
   // keys - Pointer to C style array of key Slices with num_keys elements
   // values - Pointer to C style array of PinnableSlices with num_keys elements
+  // timestamps - Pointer to C style array of std::string that, if non-null and
+  //              timestamps are enabled, will be filled with timestamps of the
+  //              keys on return. The array should be sized to num_keys entries
+  //              by the caller.
   // statuses - Pointer to C style array of Status with num_keys elements
   // sorted_input - If true, it means the input keys are already sorted by key
   //                order, so the MultiGet() API doesn't have to sort them
   //                again. If false, the keys will be copied and sorted
   //                internally by the API - the input array will not be
   //                modified
-  virtual void MultiGet(const ReadOptions& options,
-                        ColumnFamilyHandle* column_family,
-                        const size_t num_keys, const Slice* keys,
-                        PinnableSlice* values, Status* statuses,
-                        const bool /*sorted_input*/ = false) {
-    std::vector<ColumnFamilyHandle*> cf;
-    std::vector<Slice> user_keys;
-    std::vector<Status> status;
-    std::vector<std::string> vals;
 
-    for (size_t i = 0; i < num_keys; ++i) {
-      cf.emplace_back(column_family);
-      user_keys.emplace_back(keys[i]);
-    }
-    status = MultiGet(options, cf, user_keys, &vals);
-    std::copy(status.begin(), status.end(), statuses);
-    for (auto& value : vals) {
-      values->PinSelf(value);
-      values++;
-    }
-  }
+  // NOTE: Pure virtual => was virtual (optional). If the concrete
+  // implementation
+  //       doesn't support returning timestamps, and the timestamps paramater is
+  //       non-null, it should return Status::NotSupported() for all the keys.
+  virtual void MultiGet(const ReadOptions& options, const size_t num_keys,
+                        ColumnFamilyHandle** column_families, const Slice* keys,
+                        PinnableSlice* values, std::string* timestamps,
+                        Status* statuses, const bool sorted_input = false) = 0;
 
+  // MultiGet for single column family
+  // NOTE: virtual final => disallow override (was previously allowed)
   virtual void MultiGet(const ReadOptions& options,
                         ColumnFamilyHandle* column_family,
                         const size_t num_keys, const Slice* keys,
                         PinnableSlice* values, std::string* timestamps,
-                        Status* statuses, const bool /*sorted_input*/ = false) {
-    std::vector<ColumnFamilyHandle*> cf;
-    std::vector<Slice> user_keys;
-    std::vector<Status> status;
-    std::vector<std::string> vals;
-    std::vector<std::string> tss;
+                        Status* statuses,
+                        const bool sorted_input = false) final;
 
-    for (size_t i = 0; i < num_keys; ++i) {
-      cf.emplace_back(column_family);
-      user_keys.emplace_back(keys[i]);
-    }
-    status = MultiGet(options, cf, user_keys, &vals, &tss);
-    std::copy(status.begin(), status.end(), statuses);
-    std::copy(tss.begin(), tss.end(), timestamps);
-    for (auto& value : vals) {
-      values->PinSelf(value);
-      values++;
-    }
+  // MultiGet for single column family, no timestamps returned
+  // NOTE: virtual final => disallow override (was previously allowed)
+  virtual void MultiGet(const ReadOptions& options,
+                        ColumnFamilyHandle* column_family,
+                        const size_t num_keys, const Slice* keys,
+                        PinnableSlice* values, Status* statuses,
+                        const bool sorted_input = false) final {
+    MultiGet(options, column_family, num_keys, keys, values, nullptr, statuses,
+             sorted_input);
   }
 
-  // Overloaded MultiGet API that improves performance by batching operations
-  // in the read path for greater efficiency. Currently, only the block based
-  // table format with full filters are supported. Other table formats such
-  // as plain table, block based table with block based filters and
-  // partitioned indexes will still work, but will not get any performance
-  // benefits.
-  // Parameters -
-  // options - ReadOptions
-  // column_family - ColumnFamilyHandle* that the keys belong to. All the keys
-  //                 passed to the API are restricted to a single column family
-  // num_keys - Number of keys to lookup
-  // keys - Pointer to C style array of key Slices with num_keys elements
-  // values - Pointer to C style array of PinnableSlices with num_keys elements
-  // statuses - Pointer to C style array of Status with num_keys elements
-  // sorted_input - If true, it means the input keys are already sorted by key
-  //                order, so the MultiGet() API doesn't have to sort them
-  //                again. If false, the keys will be copied and sorted
-  //                internally by the API - the input array will not be
-  //                modified
+  // Multiple column families, no timestamps returned
+  // NOTE: virtual final => disallow override (was previously allowed)
   virtual void MultiGet(const ReadOptions& options, const size_t num_keys,
                         ColumnFamilyHandle** column_families, const Slice* keys,
                         PinnableSlice* values, Status* statuses,
-                        const bool /*sorted_input*/ = false) {
-    std::vector<ColumnFamilyHandle*> cf;
-    std::vector<Slice> user_keys;
-    std::vector<Status> status;
-    std::vector<std::string> vals;
-
-    for (size_t i = 0; i < num_keys; ++i) {
-      cf.emplace_back(column_families[i]);
-      user_keys.emplace_back(keys[i]);
-    }
-    status = MultiGet(options, cf, user_keys, &vals);
-    std::copy(status.begin(), status.end(), statuses);
-    for (auto& value : vals) {
-      values->PinSelf(value);
-      values++;
-    }
-  }
-  virtual void MultiGet(const ReadOptions& options, const size_t num_keys,
-                        ColumnFamilyHandle** column_families, const Slice* keys,
-                        PinnableSlice* values, std::string* timestamps,
-                        Status* statuses, const bool /*sorted_input*/ = false) {
-    std::vector<ColumnFamilyHandle*> cf;
-    std::vector<Slice> user_keys;
-    std::vector<Status> status;
-    std::vector<std::string> vals;
-    std::vector<std::string> tss;
-
-    for (size_t i = 0; i < num_keys; ++i) {
-      cf.emplace_back(column_families[i]);
-      user_keys.emplace_back(keys[i]);
-    }
-    status = MultiGet(options, cf, user_keys, &vals, &tss);
-    std::copy(status.begin(), status.end(), statuses);
-    std::copy(tss.begin(), tss.end(), timestamps);
-    for (auto& value : vals) {
-      values->PinSelf(value);
-      values++;
-    }
+                        const bool sorted_input = false) final {
+    MultiGet(options, num_keys, column_families, keys, values, nullptr,
+             statuses, sorted_input);
   }
 
   // Batched MultiGet-like API that returns wide-column entities from a single
@@ -968,6 +1075,29 @@ class DB {
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families,
       std::vector<Iterator*>* iterators) = 0;
+
+  // Return a cross-column-family iterator from a consistent database state.
+  //
+  // If a key exists in more than one column family, value() will be determined
+  // by the wide column value of kDefaultColumnName after coalesced as described
+  // below.
+  //
+  // Each wide column will be independently shadowed by the CFs.
+  // For example, if CF1 has "key_1" ==> {"col_1": "foo",
+  // "col_2", "baz"} and CF2 has "key_1" ==> {"col_2": "quux", "col_3", "bla"},
+  // and when the iterator is at key_1, columns() will return
+  // {"col_1": "foo", "col_2", "quux", "col_3", "bla"}
+  // In this example, value() will be empty, because none of them have values
+  // for kDefaultColumnName
+  virtual std::unique_ptr<Iterator> NewCoalescingIterator(
+      const ReadOptions& options,
+      const std::vector<ColumnFamilyHandle*>& column_families) = 0;
+
+  // A cross-column-family iterator that collects and returns attribute groups
+  // for each key in order provided by comparator
+  virtual std::unique_ptr<AttributeGroupIterator> NewAttributeGroupIterator(
+      const ReadOptions& options,
+      const std::vector<ColumnFamilyHandle*>& column_families) = 0;
 
   // Return a handle to the current DB state.  Iterators created with
   // this handle will all observe a stable snapshot of the current DB
@@ -1271,9 +1401,10 @@ class DB {
 
   // DB implementations export properties about their state via this method.
   // If "property" is a valid "string" property understood by this DB
-  // implementation (see Properties struct above for valid options), fills
-  // "*value" with its current value and returns true.  Otherwise, returns
-  // false.
+  // implementation (see Properties struct above for valid options) and the DB
+  // is able to get and fill "*value" with its current value, then return true.
+  // In all the other cases (e.g, "property" is an invalid "string" property, IO
+  // errors ..), it returns false.
   virtual bool GetProperty(ColumnFamilyHandle* column_family,
                            const Slice& property, std::string* value) = 0;
   virtual bool GetProperty(const Slice& property, std::string* value) {
@@ -1421,6 +1552,9 @@ class DB {
   // the files. In this case, client could set options.change_level to true, to
   // move the files back to the minimum level capable of holding the data set
   // or a given level (specified by non-negative options.target_level).
+  //
+  // For FIFO compaction, this will trigger a compaction (if available)
+  // based on CompactionOptionsFIFO.
   //
   // In case of user-defined timestamp, if enabled, `begin` and `end` should
   // not contain timestamp.
@@ -1623,8 +1757,8 @@ class DB {
   // Freezes the logical state of the DB (by stopping writes), and if WAL is
   // enabled, ensures that state has been flushed to DB files (as in
   // FlushWAL()). This can be used for taking a Checkpoint at a known DB
-  // state, though the user must use options to insure no DB flush is invoked
-  // in this frozen state. Other operations allowed on a "read only" DB should
+  // state, though while the WAL is locked, flushes as part of CreateCheckpoint
+  // and simiar are skipped. Other operations allowed on a "read only" DB should
   // work while frozen. Each LockWAL() call that returns OK must eventually be
   // followed by a corresponding call to UnlockWAL(). Where supported, non-OK
   // status is generally only possible with some kind of corruption or I/O
@@ -1643,11 +1777,6 @@ class DB {
   // The sequence number of the most recent transaction.
   virtual SequenceNumber GetLatestSequenceNumber() const = 0;
 
-  // Prevent file deletions. Compactions will continue to occur,
-  // but no obsolete files will be deleted. Calling this multiple
-  // times have the same effect as calling it once.
-  virtual Status DisableFileDeletions() = 0;
-
   // Increase the full_history_ts of column family. The new ts_low value should
   // be newer than current full_history_ts value.
   // If another thread updates full_history_ts_low concurrently to a higher
@@ -1659,26 +1788,24 @@ class DB {
   virtual Status GetFullHistoryTsLow(ColumnFamilyHandle* column_family,
                                      std::string* ts_low) = 0;
 
-  // Enable deleting obsolete files.
-  // Usually users should only need to call this if they have previously called
-  // `DisableFileDeletions`.
+  // Suspend deleting obsolete files. Compactions will continue to occur,
+  // but no obsolete files will be deleted. To resume file deletions, each
+  // call to DisableFileDeletions() must be matched by a subsequent call to
+  // EnableFileDeletions(). For more details, see EnableFileDeletions().
+  virtual Status DisableFileDeletions() = 0;
+
+  // Resume deleting obsolete files, following up on `DisableFileDeletions()`.
+  //
   // File deletions disabling and enabling is not controlled by a binary flag,
   // instead it's represented as a counter to allow different callers to
   // independently disable file deletion. Disabling file deletion can be
   // critical for operations like making a backup. So the counter implementation
   // makes the file deletion disabled as long as there is one caller requesting
   // so, and only when every caller agrees to re-enable file deletion, it will
-  // be enabled. So be careful when calling this function with force = true as
-  // explained below.
-  // If force == true, the call to EnableFileDeletions() will guarantee that
-  // file deletions are enabled after the call, even if DisableFileDeletions()
-  // was called multiple times before.
-  // If force == false, EnableFileDeletions will only enable file deletion
-  // after it's been called at least as many times as DisableFileDeletions(),
-  // enabling the two methods to be called by two threads concurrently without
+  // be enabled. Two threads can call this method concurrently without
   // synchronization -- i.e., file deletions will be enabled only after both
   // threads call EnableFileDeletions()
-  virtual Status EnableFileDeletions(bool force) = 0;
+  virtual Status EnableFileDeletions() = 0;
 
   // Retrieves the creation time of the oldest file in the DB.
   // This API only works if max_open_files = -1, if it is not then
@@ -1709,8 +1836,6 @@ class DB {
       const TransactionLogIterator::ReadOptions& read_options =
           TransactionLogIterator::ReadOptions()) = 0;
 
-// Windows API macro interference
-#undef DeleteFile
   // WARNING: This API is planned for removal in RocksDB 7.0 since it does not
   // operate at the proper level of abstraction for a key-value store, and its
   // contract/restrictions are poorly documented. For example, it returns non-OK
@@ -1722,7 +1847,7 @@ class DB {
   // Delete the file name from the db directory and update the internal state to
   // reflect that. Supports deletion of sst and log files only. 'name' must be
   // path relative to the db directory. eg. 000001.sst, /archive/000003.log
-  virtual Status DeleteFile(std::string name) = 0;
+  virtual Status DEPRECATED_DeleteFile(std::string name) = 0;
 
   // Obtains a list of all live table (SST) files and how they fit into the
   // LSM-trees, such as column family, level, key range, etc.
@@ -1782,7 +1907,7 @@ class DB {
                               bool flush_memtable = true) = 0;
 
   // Retrieve the sorted list of all wal files with earliest file first
-  virtual Status GetSortedWalFiles(VectorLogPtr& files) = 0;
+  virtual Status GetSortedWalFiles(VectorWalPtr& files) = 0;
 
   // Retrieve information about the current wal file
   //
@@ -1792,7 +1917,7 @@ class DB {
   // Additionally, for the sake of optimization current_log_file->StartSequence
   // would always be set to 0
   virtual Status GetCurrentWalFile(
-      std::unique_ptr<LogFile>* current_log_file) = 0;
+      std::unique_ptr<WalFile>* current_log_file) = 0;
 
   // IngestExternalFile() will load a list of external SST files (1) into the DB
   // Two primary modes are supported:
@@ -1804,6 +1929,15 @@ class DB {
   // to Flush the memtable first before ingesting the file.
   // In the second mode we will always ingest in the bottom most level (see
   // docs to IngestExternalFileOptions::ingest_behind).
+  // For a column family that enables user-defined timestamps, ingesting
+  // external SST files are supported with these limitations: 1) Ingested file's
+  // user key (without timestamp) range should not overlap with the db's key
+  // range. 2) When ingesting multiple external SST files, their key ranges
+  // should not overlap with each other either. 3) Ingestion behind mode is not
+  // supported. 4) When an ingested file contains point data and range deletion
+  // for the same key, the point data currently overrides the range deletion
+  // regardless which one has the higher user-defined timestamps.
+  // For FIFO compaction, SST files will always be ingested into L0.
   //
   // (1) External SST files can be created using SstFileWriter
   // (2) We will try to ingest the files to the lowest possible level
@@ -1816,6 +1950,16 @@ class DB {
   //     the files cannot be ingested to the bottommost level, and it is the
   //     user's responsibility to clear the bottommost level in the overlapping
   //     range before re-attempting the ingestion.
+  //
+  // EXPERIMENTAL: the temperatures of the files after ingestion are currently
+  // determined like this:
+  // - If the ingested file is moved rather than copied, its temperature is
+  //   inherited from the input file.
+  // - If either ingest_behind or fail_if_not_bottommost_level is set to true,
+  //   then the temperature is set to the CF's last_level_temperature.
+  // - Otherwise, the temperature is set to the CF's default_write_temperature.
+  // (Landing in the last level does not currently guarantee using
+  // last_level_temperature - TODO)
   virtual Status IngestExternalFile(
       ColumnFamilyHandle* column_family,
       const std::vector<std::string>& external_files,
@@ -1935,12 +2079,23 @@ class DB {
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,
       TablePropertiesCollection* props) = 0;
 
+  // Get the table properties of files per level.
+  virtual Status GetPropertiesOfTablesForLevels(
+      ColumnFamilyHandle* /* column_family */,
+      std::vector<
+          std::unique_ptr<TablePropertiesCollection>>* /* levels_props */) {
+    return Status::NotSupported(
+        "GetPropertiesOfTablesForLevels() is not implemented.");
+  }
+
   virtual Status SuggestCompactRange(ColumnFamilyHandle* /*column_family*/,
                                      const Slice* /*begin*/,
                                      const Slice* /*end*/) {
     return Status::NotSupported("SuggestCompactRange() is not implemented.");
   }
 
+  // Trivially move L0 files to target level. Should not be called with another
+  // PromoteL0() concurrently
   virtual Status PromoteL0(ColumnFamilyHandle* /*column_family*/,
                            int /*target_level*/) {
     return Status::NotSupported("PromoteL0() is not implemented.");

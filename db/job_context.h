@@ -35,6 +35,12 @@ struct SuperVersionContext {
   std::unique_ptr<SuperVersion>
       new_superversion;  // if nullptr no new superversion
 
+  // If not nullptr, a new seqno to time mapping is available to be installed.
+  // Otherwise, make a shared copy of the one in the existing SuperVersion and
+  // carry it over to the new SuperVersion. This is moved to the SuperVersion
+  // during installation.
+  std::shared_ptr<const SeqnoToTimeMapping> new_seqno_to_time_mapping{nullptr};
+
   explicit SuperVersionContext(bool create_superversion = false)
       : new_superversion(create_superversion ? new SuperVersion() : nullptr) {}
 
@@ -185,7 +191,7 @@ struct JobContext {
   std::vector<std::string> manifest_delete_files;
 
   // a list of memtables to be free
-  autovector<MemTable*> memtables_to_free;
+  autovector<ReadOnlyMemTable*> memtables_to_free;
 
   // contexts for installing superversions for multiple column families
   std::vector<SuperVersionContext> superversion_contexts;
@@ -196,6 +202,10 @@ struct JobContext {
   // that corresponds to the set of files in 'live'.
   uint64_t manifest_file_number;
   uint64_t pending_manifest_file_number;
+
+  // Used for remote compaction. To prevent OPTIONS files from getting
+  // purged by PurgeObsoleteFiles() of the primary host
+  uint64_t min_options_file_number;
   uint64_t log_number;
   uint64_t prev_log_number;
 

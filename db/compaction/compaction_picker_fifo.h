@@ -18,26 +18,28 @@ class FIFOCompactionPicker : public CompactionPicker {
                        const InternalKeyComparator* icmp)
       : CompactionPicker(ioptions, icmp) {}
 
-  virtual Compaction* PickCompaction(const std::string& cf_name,
-                                     const MutableCFOptions& mutable_cf_options,
-                                     const MutableDBOptions& mutable_db_options,
-                                     VersionStorageInfo* version,
-                                     LogBuffer* log_buffer) override;
-
-  virtual Compaction* CompactRange(
+  Compaction* PickCompaction(
       const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
-      const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
-      int input_level, int output_level,
-      const CompactRangeOptions& compact_range_options,
-      const InternalKey* begin, const InternalKey* end,
-      InternalKey** compaction_end, bool* manual_conflict,
-      uint64_t max_file_num_to_ignore, const std::string& trim_ts) override;
+      const MutableDBOptions& mutable_db_options,
+      const std::vector<SequenceNumber>& /* existing_snapshots */,
+      const SnapshotChecker* /* snapshot_checker */,
+      VersionStorageInfo* version, LogBuffer* log_buffer) override;
+
+  Compaction* CompactRange(const std::string& cf_name,
+                           const MutableCFOptions& mutable_cf_options,
+                           const MutableDBOptions& mutable_db_options,
+                           VersionStorageInfo* vstorage, int input_level,
+                           int output_level,
+                           const CompactRangeOptions& compact_range_options,
+                           const InternalKey* begin, const InternalKey* end,
+                           InternalKey** compaction_end, bool* manual_conflict,
+                           uint64_t max_file_num_to_ignore,
+                           const std::string& trim_ts) override;
 
   // The maximum allowed output level.  Always returns 0.
-  virtual int MaxOutputLevel() const override { return 0; }
+  int MaxOutputLevel() const override { return 0; }
 
-  virtual bool NeedsCompaction(
-      const VersionStorageInfo* vstorage) const override;
+  bool NeedsCompaction(const VersionStorageInfo* vstorage) const override;
 
  private:
   Compaction* PickTTLCompaction(const std::string& cf_name,
@@ -52,9 +54,10 @@ class FIFOCompactionPicker : public CompactionPicker {
                                  VersionStorageInfo* version,
                                  LogBuffer* log_buffer);
 
+  // Will pick one file to compact at a time, starting from the oldest file.
   Compaction* PickTemperatureChangeCompaction(
       const std::string& cf_name, const MutableCFOptions& mutable_cf_options,
       const MutableDBOptions& mutable_db_options, VersionStorageInfo* vstorage,
-      LogBuffer* log_buffer);
+      LogBuffer* log_buffer) const;
 };
 }  // namespace ROCKSDB_NAMESPACE

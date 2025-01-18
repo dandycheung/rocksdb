@@ -31,13 +31,13 @@ public class BlockBasedTableConfig extends TableFormatConfig {
     indexBlockRestartInterval = 1;
     metadataBlockSize = 4096;
     partitionFilters = false;
-    optimizeFiltersForMemory = false;
+    optimizeFiltersForMemory = true;
     useDeltaEncoding = true;
     filterPolicy = null;
     wholeKeyFiltering = true;
     verifyCompression = false;
     readAmpBytesPerBit = 0;
-    formatVersion = 5;
+    formatVersion = 6;
     enableIndexCompression = true;
     blockAlign = false;
     indexShortening = IndexShorteningMode.kShortenSeparators;
@@ -949,7 +949,7 @@ public class BlockBasedTableConfig extends TableFormatConfig {
         indexShortening.getValue(), blockCacheSize, blockCacheNumShardBits);
   }
 
-  private native long newTableFactoryHandle(final boolean cacheIndexAndFilterBlocks,
+  private static native long newTableFactoryHandle(final boolean cacheIndexAndFilterBlocks,
       final boolean cacheIndexAndFilterBlocksWithHighPriority,
       final boolean pinL0FilterAndIndexBlocksInCache, final boolean pinTopLevelIndexAndFilter,
       final byte indexTypeValue, final byte dataBlockIndexTypeValue,

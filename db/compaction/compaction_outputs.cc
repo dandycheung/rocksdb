@@ -25,11 +25,13 @@ Status CompactionOutputs::Finish(
   assert(meta != nullptr);
   Status s = intput_status;
   if (s.ok()) {
-    std::string seqno_to_time_mapping_str;
-    seqno_to_time_mapping.Encode(
-        seqno_to_time_mapping_str, meta->fd.smallest_seqno,
-        meta->fd.largest_seqno, meta->file_creation_time);
-    builder_->SetSeqnoTimeTableProperties(seqno_to_time_mapping_str,
+    SeqnoToTimeMapping relevant_mapping;
+    relevant_mapping.CopyFromSeqnoRange(
+        seqno_to_time_mapping,
+        std::min(smallest_preferred_seqno_, meta->fd.smallest_seqno),
+        meta->fd.largest_seqno);
+    relevant_mapping.SetCapacity(kMaxSeqnoTimePairsPerSST);
+    builder_->SetSeqnoTimeTableProperties(relevant_mapping,
                                           meta->oldest_ancester_time);
     s = builder_->Finish();
 
@@ -318,9 +320,8 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     // More details, check PR #1963
     const size_t num_skippable_boundaries_crossed =
         being_grandparent_gap_ ? 2 : 3;
-    if (compaction_->immutable_options()->compaction_style ==
+    if (compaction_->immutable_options().compaction_style ==
             kCompactionStyleLevel &&
-        compaction_->immutable_options()->level_compaction_dynamic_file_size &&
         num_grandparent_boundaries_crossed >=
             num_skippable_boundaries_crossed &&
         grandparent_overlapped_bytes_ - previous_overlapped_bytes >
@@ -340,9 +341,8 @@ bool CompactionOutputs::ShouldStopBefore(const CompactionIterator& c_iter) {
     // target file size. The test shows it can generate larger files than a
     // static threshold like 75% and has a similar write amplification
     // improvement.
-    if (compaction_->immutable_options()->compaction_style ==
+    if (compaction_->immutable_options().compaction_style ==
             kCompactionStyleLevel &&
-        compaction_->immutable_options()->level_compaction_dynamic_file_size &&
         current_output_file_size_ >=
             ((compaction_->target_output_file_size() + 99) / 100) *
                 (50 + std::min(grandparent_boundary_switched_num_ * 5,
@@ -424,6 +424,11 @@ Status CompactionOutputs::AddToOutput(
   }
 
   const ParsedInternalKey& ikey = c_iter.ikey();
+  if (ikey.type == kTypeValuePreferredSeqno) {
+    SequenceNumber preferred_seqno = ParsePackedValueForSeqno(value);
+    smallest_preferred_seqno_ =
+        std::min(smallest_preferred_seqno_, preferred_seqno);
+  }
   s = current_output().meta.UpdateBoundaries(key, value, ikey.sequence,
                                              ikey.type);
 
@@ -450,9 +455,11 @@ void SetMaxSeqAndTs(InternalKey& internal_key, const Slice& user_key,
 }  // namespace
 
 Status CompactionOutputs::AddRangeDels(
+    CompactionRangeDelAggregator& range_del_agg,
     const Slice* comp_start_user_key, const Slice* comp_end_user_key,
     CompactionIterationStats& range_del_out_stats, bool bottommost_level,
     const InternalKeyComparator& icmp, SequenceNumber earliest_snapshot,
+    std::pair<SequenceNumber, SequenceNumber> keep_seqno_range,
     const Slice& next_table_min_key, const std::string& full_history_ts_low) {
   // The following example does not happen since
   // CompactionOutput::ShouldStopBefore() always return false for the first
@@ -465,7 +472,7 @@ Status CompactionOutputs::AddRangeDels(
   // Then meta.smallest will be set to comp_start_user_key@seqno
   // and meta.largest will be set to comp_start_user_key@kMaxSequenceNumber
   // which violates the assumption that meta.smallest should be <= meta.largest.
-  assert(HasRangeDel());
+  assert(!range_del_agg.IsEmpty());
   FileMetaData& meta = current_output().meta;
   const Comparator* ucmp = icmp.user_comparator();
   InternalKey lower_bound_buf, upper_bound_buf;
@@ -574,13 +581,19 @@ Status CompactionOutputs::AddRangeDels(
   assert(comp_end_user_key == nullptr || upper_bound == nullptr ||
          ucmp->CompareWithoutTimestamp(ExtractUserKey(*upper_bound),
                                        *comp_end_user_key) <= 0);
-  auto it = range_del_agg_->NewIterator(lower_bound, upper_bound);
+  auto it = range_del_agg.NewIterator(lower_bound, upper_bound);
   Slice last_tombstone_start_user_key{};
   bool reached_lower_bound = false;
   const ReadOptions read_options(Env::IOActivity::kCompaction);
   for (it->SeekToFirst(); it->Valid(); it->Next()) {
     auto tombstone = it->Tombstone();
     auto kv = tombstone.Serialize();
+    // Filter out by seqno for per-key placement
+    if (tombstone.seq_ < keep_seqno_range.first ||
+        tombstone.seq_ >= keep_seqno_range.second) {
+      continue;
+    }
+
     InternalKey tombstone_end = tombstone.SerializeEndKey();
     // TODO: the underlying iterator should support clamping the bounds.
     // tombstone_end.Encode is of form user_key@kMaxSeqno
@@ -739,11 +752,10 @@ Status CompactionOutputs::AddRangeDels(
 }
 
 void CompactionOutputs::FillFilesToCutForTtl() {
-  if (compaction_->immutable_options()->compaction_style !=
+  if (compaction_->immutable_options().compaction_style !=
           kCompactionStyleLevel ||
-      compaction_->immutable_options()->compaction_pri !=
-          kMinOverlappingRatio ||
-      compaction_->mutable_cf_options()->ttl == 0 ||
+      compaction_->immutable_options().compaction_pri != kMinOverlappingRatio ||
+      compaction_->mutable_cf_options().ttl == 0 ||
       compaction_->num_input_levels() < 2 || compaction_->bottommost_level()) {
     return;
   }
@@ -751,20 +763,19 @@ void CompactionOutputs::FillFilesToCutForTtl() {
   // We define new file with the oldest ancestor time to be younger than 1/4
   // TTL, and an old one to be older than 1/2 TTL time.
   int64_t temp_current_time;
-  auto get_time_status =
-      compaction_->immutable_options()->clock->GetCurrentTime(
-          &temp_current_time);
+  auto get_time_status = compaction_->immutable_options().clock->GetCurrentTime(
+      &temp_current_time);
   if (!get_time_status.ok()) {
     return;
   }
 
   auto current_time = static_cast<uint64_t>(temp_current_time);
-  if (current_time < compaction_->mutable_cf_options()->ttl) {
+  if (current_time < compaction_->mutable_cf_options().ttl) {
     return;
   }
 
   uint64_t old_age_thres =
-      current_time - compaction_->mutable_cf_options()->ttl / 2;
+      current_time - compaction_->mutable_cf_options().ttl / 2;
   const std::vector<FileMetaData*>& olevel =
       *(compaction_->inputs(compaction_->num_input_levels() - 1));
   for (FileMetaData* file : olevel) {
@@ -774,7 +785,7 @@ void CompactionOutputs::FillFilesToCutForTtl() {
     // of small files.
     if (oldest_ancester_time < old_age_thres &&
         file->fd.GetFileSize() >
-            compaction_->mutable_cf_options()->target_file_size_base / 2) {
+            compaction_->mutable_cf_options().target_file_size_base / 2) {
       files_to_cut_for_ttl_.push_back(file);
     }
   }

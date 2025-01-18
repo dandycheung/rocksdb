@@ -560,7 +560,7 @@ void BaseClockTable::TrackAndReleaseEvictedEntry(ClockHandle* h) {
     took_value_ownership =
         eviction_callback_(ClockCacheShard<FixedHyperClockTable>::ReverseHash(
                                h->GetHash(), &unhashed, hash_seed_),
-                           reinterpret_cast<Cache::Handle*>(h),
+                           static_cast<Cache::Handle*>(h),
                            h->meta.LoadRelaxed() & ClockHandle::kHitBitMask);
   }
   if (!took_value_ownership) {
@@ -1428,20 +1428,36 @@ BaseHyperClockCache<Table>::BaseHyperClockCache(
 
 template <class Table>
 Cache::ObjectPtr BaseHyperClockCache<Table>::Value(Handle* handle) {
-  return reinterpret_cast<const typename Table::HandleImpl*>(handle)->value;
+  return static_cast<const typename Table::HandleImpl*>(handle)->value;
 }
 
 template <class Table>
 size_t BaseHyperClockCache<Table>::GetCharge(Handle* handle) const {
-  return reinterpret_cast<const typename Table::HandleImpl*>(handle)
+  return static_cast<const typename Table::HandleImpl*>(handle)
       ->GetTotalCharge();
 }
 
 template <class Table>
 const Cache::CacheItemHelper* BaseHyperClockCache<Table>::GetCacheItemHelper(
     Handle* handle) const {
-  auto h = reinterpret_cast<const typename Table::HandleImpl*>(handle);
+  auto h = static_cast<const typename Table::HandleImpl*>(handle);
   return h->helper;
+}
+
+template <class Table>
+void BaseHyperClockCache<Table>::ApplyToHandle(
+    Cache* cache, Handle* handle,
+    const std::function<void(const Slice& key, Cache::ObjectPtr value,
+                             size_t charge, const CacheItemHelper* helper)>&
+        callback) {
+  BaseHyperClockCache<Table>* cache_ptr =
+      static_cast<BaseHyperClockCache<Table>*>(cache);
+  auto h = static_cast<const typename Table::HandleImpl*>(handle);
+  UniqueId64x2 unhashed;
+  auto hash_seed = cache_ptr->GetShard(h->GetHash()).GetTable().GetHashSeed();
+  callback(
+      ClockCacheShard<Table>::ReverseHash(h->hashed_key, &unhashed, hash_seed),
+      h->value, h->GetTotalCharge(), h->helper);
 }
 
 namespace {

@@ -19,17 +19,17 @@ namespace ROCKSDB_NAMESPACE {
 
 // Utility function to copy a file up to a specified length
 IOStatus CopyFile(FileSystem* fs, const std::string& source,
+                  Temperature src_temp_hint,
                   std::unique_ptr<WritableFileWriter>& dest_writer,
                   uint64_t size, bool use_fsync,
-                  const std::shared_ptr<IOTracer>& io_tracer,
-                  const Temperature temperature) {
+                  const std::shared_ptr<IOTracer>& io_tracer) {
   FileOptions soptions;
   IOStatus io_s;
   std::unique_ptr<SequentialFileReader> src_reader;
   const IOOptions opts;
 
   {
-    soptions.temperature = temperature;
+    soptions.temperature = src_temp_hint;
     std::unique_ptr<FSSequentialFile> srcfile;
     io_s = fs->NewSequentialFile(source, soptions, &srcfile, nullptr);
     if (!io_s.ok()) {
@@ -59,7 +59,10 @@ IOStatus CopyFile(FileSystem* fs, const std::string& source,
       return io_s;
     }
     if (slice.size() == 0) {
-      return IOStatus::Corruption("file too small");
+      return IOStatus::Corruption(
+          "File smaller than expected for copy: " + source + " expecting " +
+          std::to_string(size) + " more bytes after " +
+          std::to_string(dest_writer->GetFileSize()));
     }
 
     io_s = dest_writer->Append(opts, slice);
@@ -72,15 +75,15 @@ IOStatus CopyFile(FileSystem* fs, const std::string& source,
 }
 
 IOStatus CopyFile(FileSystem* fs, const std::string& source,
-                  const std::string& destination, uint64_t size, bool use_fsync,
-                  const std::shared_ptr<IOTracer>& io_tracer,
-                  const Temperature temperature) {
+                  Temperature src_temp_hint, const std::string& destination,
+                  Temperature dst_temp, uint64_t size, bool use_fsync,
+                  const std::shared_ptr<IOTracer>& io_tracer) {
   FileOptions options;
   IOStatus io_s;
   std::unique_ptr<WritableFileWriter> dest_writer;
 
   {
-    options.temperature = temperature;
+    options.temperature = dst_temp;
     std::unique_ptr<FSWritableFile> destfile;
     io_s = fs->NewWritableFile(destination, options, &destfile, nullptr);
     if (!io_s.ok()) {
@@ -92,8 +95,8 @@ IOStatus CopyFile(FileSystem* fs, const std::string& source,
         new WritableFileWriter(std::move(destfile), destination, options));
   }
 
-  return CopyFile(fs, source, dest_writer, size, use_fsync, io_tracer,
-                  temperature);
+  return CopyFile(fs, source, src_temp_hint, dest_writer, size, use_fsync,
+                  io_tracer);
 }
 
 // Utility function to create a file with the provided contents
@@ -122,10 +125,25 @@ IOStatus CreateFile(FileSystem* fs, const std::string& destination,
 Status DeleteDBFile(const ImmutableDBOptions* db_options,
                     const std::string& fname, const std::string& dir_to_sync,
                     const bool force_bg, const bool force_fg) {
-  SstFileManagerImpl* sfm =
-      static_cast<SstFileManagerImpl*>(db_options->sst_file_manager.get());
+  SstFileManagerImpl* sfm = static_cast_with_check<SstFileManagerImpl>(
+      db_options->sst_file_manager.get());
   if (sfm && !force_fg) {
     return sfm->ScheduleFileDeletion(fname, dir_to_sync, force_bg);
+  } else {
+    return db_options->env->DeleteFile(fname);
+  }
+}
+
+Status DeleteUnaccountedDBFile(const ImmutableDBOptions* db_options,
+                               const std::string& fname,
+                               const std::string& dir_to_sync,
+                               const bool force_bg, const bool force_fg,
+                               std::optional<int32_t> bucket) {
+  SstFileManagerImpl* sfm = static_cast_with_check<SstFileManagerImpl>(
+      db_options->sst_file_manager.get());
+  if (sfm && !force_fg) {
+    return sfm->ScheduleUnaccountedFileDeletion(fname, dir_to_sync, force_bg,
+                                                bucket);
   } else {
     return db_options->env->DeleteFile(fname);
   }
@@ -226,7 +244,10 @@ IOStatus GenerateOneFileChecksum(
                                   io_s.ToString());
     }
     if (slice.size() == 0) {
-      return IOStatus::Corruption("file too small");
+      return IOStatus::Corruption(
+          "File smaller than expected for checksum: " + file_path +
+          " expecting " + std::to_string(size) + " more bytes after " +
+          std::to_string(offset));
     }
     checksum_generator->Update(slice.data(), slice.size());
     size -= slice.size();

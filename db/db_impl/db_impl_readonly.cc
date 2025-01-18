@@ -8,14 +8,13 @@
 #include "db/arena_wrapped_db_iter.h"
 #include "db/db_impl/compacted_db_impl.h"
 #include "db/db_impl/db_impl.h"
-#include "db/db_iter.h"
+#include "db/manifest_ops.h"
 #include "db/merge_context.h"
 #include "logging/logging.h"
 #include "monitoring/perf_context_imp.h"
 #include "util/cast_util.h"
 
 namespace ROCKSDB_NAMESPACE {
-
 
 DBImplReadOnly::DBImplReadOnly(const DBOptions& db_options,
                                const std::string& dbname)
@@ -26,7 +25,7 @@ DBImplReadOnly::DBImplReadOnly(const DBOptions& db_options,
   LogFlush(immutable_db_options_.info_log);
 }
 
-DBImplReadOnly::~DBImplReadOnly() {}
+DBImplReadOnly::~DBImplReadOnly() = default;
 
 // Implementations of the DB interface
 Status DBImplReadOnly::GetImpl(const ReadOptions& read_options,
@@ -169,12 +168,11 @@ Iterator* DBImplReadOnly::NewIterator(const ReadOptions& _read_options,
   SequenceNumber latest_snapshot = versions_->LastSequence();
   SequenceNumber read_seq =
       read_options.snapshot != nullptr
-          ? reinterpret_cast<const SnapshotImpl*>(read_options.snapshot)
-                ->number_
+          ? static_cast<const SnapshotImpl*>(read_options.snapshot)->number_
           : latest_snapshot;
   ReadCallback* read_callback = nullptr;  // No read callback provided.
   auto db_iter = NewArenaWrappedDbIterator(
-      env_, read_options, *cfd->ioptions(), super_version->mutable_cf_options,
+      env_, read_options, cfd->ioptions(), super_version->mutable_cf_options,
       super_version->current, read_seq,
       super_version->mutable_cf_options.max_sequential_skip_in_iterations,
       super_version->version_number, read_callback);
@@ -216,8 +214,7 @@ Status DBImplReadOnly::NewIterators(
   SequenceNumber latest_snapshot = versions_->LastSequence();
   SequenceNumber read_seq =
       read_options.snapshot != nullptr
-          ? reinterpret_cast<const SnapshotImpl*>(read_options.snapshot)
-                ->number_
+          ? static_cast<const SnapshotImpl*>(read_options.snapshot)->number_
           : latest_snapshot;
 
   autovector<std::tuple<ColumnFamilyData*, SuperVersion*>> cfd_to_sv;
@@ -242,7 +239,7 @@ Status DBImplReadOnly::NewIterators(
   assert(cfd_to_sv.size() == column_families.size());
   for (auto [cfd, sv] : cfd_to_sv) {
     auto* db_iter = NewArenaWrappedDbIterator(
-        env_, read_options, *cfd->ioptions(), sv->mutable_cf_options,
+        env_, read_options, cfd->ioptions(), sv->mutable_cf_options,
         sv->current, read_seq,
         sv->mutable_cf_options.max_sequential_skip_in_iterations,
         sv->version_number, read_callback);
@@ -267,8 +264,8 @@ Status OpenForReadOnlyCheckExistence(const DBOptions& db_options,
     const std::shared_ptr<FileSystem>& fs = db_options.env->GetFileSystem();
     std::string manifest_path;
     uint64_t manifest_file_number;
-    s = VersionSet::GetCurrentManifestPath(dbname, fs.get(), &manifest_path,
-                                           &manifest_file_number);
+    s = GetCurrentManifestPath(dbname, fs.get(), /*is_retry=*/false,
+                               &manifest_path, &manifest_file_number);
   } else {
     // Historic behavior that doesn't necessarily make sense
     s = db_options.env->CreateDirIfMissing(dbname);
@@ -278,7 +275,8 @@ Status OpenForReadOnlyCheckExistence(const DBOptions& db_options,
 }  // namespace
 
 Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
-                           DB** dbptr, bool /*error_if_wal_file_exists*/) {
+                           std::unique_ptr<DB>* dbptr,
+                           bool /*error_if_wal_file_exists*/) {
   Status s = OpenForReadOnlyCheckExistence(options, dbname);
   if (!s.ok()) {
     return s;
@@ -295,8 +293,7 @@ Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
   DBOptions db_options(options);
   ColumnFamilyOptions cf_options(options);
   std::vector<ColumnFamilyDescriptor> column_families;
-  column_families.push_back(
-      ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
+  column_families.emplace_back(kDefaultColumnFamilyName, cf_options);
   std::vector<ColumnFamilyHandle*> handles;
 
   s = DBImplReadOnly::OpenForReadOnlyWithoutCheck(
@@ -313,7 +310,7 @@ Status DB::OpenForReadOnly(const Options& options, const std::string& dbname,
 Status DB::OpenForReadOnly(
     const DBOptions& db_options, const std::string& dbname,
     const std::vector<ColumnFamilyDescriptor>& column_families,
-    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+    std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool error_if_wal_file_exists) {
   // If dbname does not exist in the file system, should not do anything
   Status s = OpenForReadOnlyCheckExistence(db_options, dbname);
@@ -329,7 +326,7 @@ Status DB::OpenForReadOnly(
 Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
     const DBOptions& db_options, const std::string& dbname,
     const std::vector<ColumnFamilyDescriptor>& column_families,
-    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+    std::vector<ColumnFamilyHandle*>* handles, std::unique_ptr<DB>* dbptr,
     bool error_if_wal_file_exists) {
   *dbptr = nullptr;
   handles->clear();
@@ -341,7 +338,7 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
                            error_if_wal_file_exists);
   if (s.ok()) {
     // set column family handles
-    for (auto cf : column_families) {
+    for (const auto& cf : column_families) {
       auto cfd =
           impl->versions_->GetColumnFamilySet()->GetColumnFamily(cf.name);
       if (cfd == nullptr) {
@@ -360,7 +357,7 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
   impl->mutex_.Unlock();
   sv_context.Clean();
   if (s.ok()) {
-    *dbptr = impl;
+    dbptr->reset(impl);
     for (auto* h : *handles) {
       impl->NewThreadStatusCfInfo(
           static_cast_with_check<ColumnFamilyHandleImpl>(h)->cfd());
@@ -374,6 +371,5 @@ Status DBImplReadOnly::OpenForReadOnlyWithoutCheck(
   }
   return s;
 }
-
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -25,7 +25,7 @@ namespace ROCKSDB_NAMESPACE {
 // and the value type is embedded as the low 8 bits in the sequence
 // number in internal keys, we need to use the highest-numbered
 // ValueType, not the lowest).
-const ValueType kValueTypeForSeek = kTypeWideColumnEntity;
+const ValueType kValueTypeForSeek = kTypeValuePreferredSeqno;
 const ValueType kValueTypeForSeekForPrev = kTypeDeletion;
 const std::string kDisableUserTimestamp;
 
@@ -47,6 +47,8 @@ EntryType GetEntryType(ValueType value_type) {
       return kEntryBlobIndex;
     case kTypeWideColumnEntity:
       return kEntryWideColumnEntity;
+    case kTypeValuePreferredSeqno:
+      return kEntryTimedPut;
     default:
       return kEntryOther;
   }
@@ -64,6 +66,13 @@ void AppendInternalKeyWithDifferentTimestamp(std::string* result,
   result->append(key.user_key.data(), key.user_key.size() - ts.size());
   result->append(ts.data(), ts.size());
   PutFixed64(result, PackSequenceAndType(key.sequence, key.type));
+}
+
+void AppendUserKeyWithDifferentTimestamp(std::string* result, const Slice& key,
+                                         const Slice& ts) {
+  assert(key.size() >= ts.size());
+  result->append(key.data(), key.size() - ts.size());
+  result->append(ts.data(), ts.size());
 }
 
 void AppendInternalKeyFooter(std::string* result, SequenceNumber s,
@@ -110,10 +119,22 @@ void AppendUserKeyWithMaxTimestamp(std::string* result, const Slice& key,
 void PadInternalKeyWithMinTimestamp(std::string* result, const Slice& key,
                                     size_t ts_sz) {
   assert(ts_sz > 0);
+  assert(key.size() >= kNumInternalBytes);
   size_t user_key_size = key.size() - kNumInternalBytes;
   result->reserve(key.size() + ts_sz);
   result->append(key.data(), user_key_size);
   result->append(ts_sz, static_cast<unsigned char>(0));
+  result->append(key.data() + user_key_size, kNumInternalBytes);
+}
+
+void PadInternalKeyWithMaxTimestamp(std::string* result, const Slice& key,
+                                    size_t ts_sz) {
+  assert(ts_sz > 0);
+  assert(key.size() >= kNumInternalBytes);
+  size_t user_key_size = key.size() - kNumInternalBytes;
+  result->reserve(key.size() + ts_sz);
+  result->append(key.data(), user_key_size);
+  result->append(std::string(ts_sz, '\xff'));
   result->append(key.data() + user_key_size, kNumInternalBytes);
 }
 
@@ -136,27 +157,38 @@ void ReplaceInternalKeyWithMinTimestamp(std::string* result, const Slice& key,
   result->append(key.data() + key_sz - kNumInternalBytes, kNumInternalBytes);
 }
 
-std::string ParsedInternalKey::DebugString(bool log_err_key, bool hex) const {
+std::string ParsedInternalKey::DebugString(bool log_err_key, bool hex,
+                                           const Comparator* ucmp) const {
   std::string result = "'";
+  size_t ts_sz_for_debug = ucmp == nullptr ? 0 : ucmp->timestamp_size();
   if (log_err_key) {
-    result += user_key.ToString(hex);
+    if (ts_sz_for_debug == 0) {
+      result += user_key.ToString(hex);
+    } else {
+      assert(user_key.size() >= ts_sz_for_debug);
+      Slice user_key_without_ts = user_key;
+      user_key_without_ts.remove_suffix(ts_sz_for_debug);
+      result += user_key_without_ts.ToString(hex);
+      Slice ts = Slice(user_key.data() + user_key.size() - ts_sz_for_debug,
+                       ts_sz_for_debug);
+      result += "|timestamp:";
+      result += ucmp->TimestampToString(ts);
+    }
   } else {
     result += "<redacted>";
   }
 
-  char buf[50];
-  snprintf(buf, sizeof(buf), "' seq:%" PRIu64 ", type:%d", sequence,
-           static_cast<int>(type));
+  result += "' seq:" + std::to_string(sequence);
+  result += ", type:" + std::to_string(type);
 
-  result += buf;
   return result;
 }
 
-std::string InternalKey::DebugString(bool hex) const {
+std::string InternalKey::DebugString(bool hex, const Comparator* ucmp) const {
   std::string result;
   ParsedInternalKey parsed;
   if (ParseInternalKey(rep_, &parsed, false /* log_err_key */).ok()) {
-    result = parsed.DebugString(true /* log_err_key */, hex);  // TODO
+    result = parsed.DebugString(true /* log_err_key */, hex, ucmp);  // TODO
   } else {
     result = "(bad)";
     result.append(EscapeString(rep_));
@@ -238,11 +270,23 @@ LookupKey::LookupKey(const Slice& _user_key, SequenceNumber s,
 
 void IterKey::EnlargeBuffer(size_t key_size) {
   // If size is smaller than buffer size, continue using current buffer,
-  // or the static allocated one, as default
+  // or the inline one, as default
   assert(key_size > buf_size_);
   // Need to enlarge the buffer.
   ResetBuffer();
   buf_ = new char[key_size];
   buf_size_ = key_size;
+}
+
+void IterKey::EnlargeSecondaryBufferIfNeeded(size_t key_size) {
+  // If size is smaller than buffer size, continue using current buffer,
+  // or the inline one, as default
+  if (key_size <= secondary_buf_size_) {
+    return;
+  }
+  // Need to enlarge the secondary buffer.
+  ResetSecondaryBuffer();
+  secondary_buf_ = new char[key_size];
+  secondary_buf_size_ = key_size;
 }
 }  // namespace ROCKSDB_NAMESPACE

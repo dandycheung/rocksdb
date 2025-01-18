@@ -86,8 +86,8 @@ TEST_F(DBFlushTest, SyncFail) {
   options.env = fault_injection_env.get();
 
   SyncPoint::GetInstance()->LoadDependency(
-      {{"DBFlushTest::SyncFail:1", "DBImpl::SyncClosedLogs:Start"},
-       {"DBImpl::SyncClosedLogs:Failed", "DBFlushTest::SyncFail:2"}});
+      {{"DBFlushTest::SyncFail:1", "DBImpl::SyncClosedWals:Start"},
+       {"DBImpl::SyncClosedWals:Failed", "DBFlushTest::SyncFail:2"}});
   SyncPoint::GetInstance()->EnableProcessing();
 
   CreateAndReopenWithCF({"pikachu"}, options);
@@ -111,8 +111,8 @@ TEST_F(DBFlushTest, SyncSkip) {
   Options options = CurrentOptions();
 
   SyncPoint::GetInstance()->LoadDependency(
-      {{"DBFlushTest::SyncSkip:1", "DBImpl::SyncClosedLogs:Skip"},
-       {"DBImpl::SyncClosedLogs:Skip", "DBFlushTest::SyncSkip:2"}});
+      {{"DBFlushTest::SyncSkip:1", "DBImpl::SyncClosedWals:Skip"},
+       {"DBImpl::SyncClosedWals:Skip", "DBFlushTest::SyncSkip:2"}});
   SyncPoint::GetInstance()->EnableProcessing();
 
   Reopen(options);
@@ -272,7 +272,7 @@ TEST_F(DBFlushTest, ScheduleOnlyOneBgThread) {
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::MaybeScheduleFlushOrCompaction:AfterSchedule:0", [&](void* arg) {
         ASSERT_NE(nullptr, arg);
-        auto unscheduled_flushes = *reinterpret_cast<int*>(arg);
+        auto unscheduled_flushes = *static_cast<int*>(arg);
         ASSERT_EQ(0, unscheduled_flushes);
         ++called;
       });
@@ -1367,14 +1367,15 @@ TEST_F(DBFlushTest, MemPurgeDeleteAndDeleteRange) {
       ASSERT_OK(iter->status());
       key = (iter->key()).ToString(false);
       value = (iter->value()).ToString(false);
-      if (key.compare(KEY3) == 0)
+      if (key.compare(KEY3) == 0) {
         ASSERT_EQ(value, p_v3b);
-      else if (key.compare(KEY4) == 0)
+      } else if (key.compare(KEY4) == 0) {
         ASSERT_EQ(value, p_v4);
-      else if (key.compare(KEY5) == 0)
+      } else if (key.compare(KEY5) == 0) {
         ASSERT_EQ(value, p_v5);
-      else
+      } else {
         ASSERT_EQ(value, NOT_FOUND);
+      }
       count++;
     }
     ASSERT_OK(iter->status());
@@ -1404,22 +1405,25 @@ TEST_F(DBFlushTest, MemPurgeDeleteAndDeleteRange) {
     ASSERT_OK(iter->status());
     key = (iter->key()).ToString(false);
     value = (iter->value()).ToString(false);
-    if (key.compare(KEY2) == 0)
+    if (key.compare(KEY2) == 0) {
       ASSERT_EQ(value, p_v2);
-    else if (key.compare(KEY3) == 0)
+    } else if (key.compare(KEY3) == 0) {
       ASSERT_EQ(value, p_v3b);
-    else if (key.compare(KEY4) == 0)
+    } else if (key.compare(KEY4) == 0) {
       ASSERT_EQ(value, p_v4);
-    else if (key.compare(KEY5) == 0)
+    } else if (key.compare(KEY5) == 0) {
       ASSERT_EQ(value, p_v5);
-    else
+    } else {
       ASSERT_EQ(value, NOT_FOUND);
+    }
     count++;
   }
 
   // Expected count here is 4: KEY2, KEY3, KEY4, KEY5.
   ASSERT_EQ(count, EXPECTED_COUNT_END);
-  if (iter) delete iter;
+  if (iter) {
+    delete iter;
+  }
 
   Close();
 }
@@ -1791,7 +1795,7 @@ TEST_F(DBFlushTest, MemPurgeCorrectLogNumberAndSSTFileCreation) {
   std::atomic<uint64_t> num_memtable_at_first_flush(0);
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "FlushJob::WriteLevel0Table:num_memtables", [&](void* arg) {
-        uint64_t* mems_size = reinterpret_cast<uint64_t*>(arg);
+        uint64_t* mems_size = static_cast<uint64_t*>(arg);
         // atomic_compare_exchange_strong sometimes updates the value
         // of ZERO (the "expected" object), so we make sure ZERO is indeed...
         // zero.
@@ -2038,7 +2042,7 @@ TEST_F(DBFlushTest, FireOnFlushCompletedAfterCommittedResult) {
   SyncPoint::GetInstance()->SetCallBack(
       "FlushJob::WriteLevel0Table", [&listener](void* arg) {
         // Wait for the second flush finished, out of mutex.
-        auto* mems = reinterpret_cast<autovector<MemTable*>*>(arg);
+        auto* mems = static_cast<autovector<MemTable*>*>(arg);
         if (mems->front()->GetEarliestSequenceNumber() == listener->seq1 - 1) {
           TEST_SYNC_POINT(
               "DBFlushTest::FireOnFlushCompletedAfterCommittedResult:"
@@ -2377,7 +2381,7 @@ TEST_F(DBFlushTest, PickRightMemtables) {
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   SyncPoint::GetInstance()->SetCallBack(
-      "DBImpl::SyncClosedLogs:BeforeReLock", [&](void* /*arg*/) {
+      "DBImpl::SyncClosedWals:BeforeReLock", [&](void* /*arg*/) {
         ASSERT_OK(db_->Put(WriteOptions(), handles_[1], "what", "v"));
         auto* cfhi =
             static_cast_with_check<ColumnFamilyHandleImpl>(handles_[1]);
@@ -2386,7 +2390,7 @@ TEST_F(DBFlushTest, PickRightMemtables) {
       });
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::FlushMemTableToOutputFile:AfterPickMemtables", [&](void* arg) {
-        auto* job = reinterpret_cast<FlushJob*>(arg);
+        auto* job = static_cast<FlushJob*>(arg);
         assert(job);
         const auto& mems = job->GetMemTables();
         assert(mems.size() == 1);
@@ -2499,7 +2503,7 @@ TEST_F(DBFlushTest, TombstoneVisibleInSnapshot) {
   class SimpleTestFlushListener : public EventListener {
    public:
     explicit SimpleTestFlushListener(DBFlushTest* _test) : test_(_test) {}
-    ~SimpleTestFlushListener() override {}
+    ~SimpleTestFlushListener() override = default;
 
     void OnFlushBegin(DB* db, const FlushJobInfo& info) override {
       ASSERT_EQ(static_cast<uint32_t>(0), info.cf_id);
@@ -2634,7 +2638,7 @@ TEST_P(DBAtomicFlushTest, ManualFlushUnder2PC) {
   // it means atomic flush didn't write the min_log_number_to_keep to MANIFEST.
   cfs.push_back(kDefaultColumnFamilyName);
   ASSERT_OK(TryReopenWithColumnFamilies(cfs, options));
-  DBImpl* db_impl = reinterpret_cast<DBImpl*>(db_);
+  DBImpl* db_impl = static_cast<DBImpl*>(db_);
   ASSERT_TRUE(db_impl->allow_2pc());
   ASSERT_NE(db_impl->MinLogNumberToKeep(), 0);
 }
@@ -3171,7 +3175,7 @@ TEST_P(DBAtomicFlushTest, BgThreadNoWaitAfterManifestError) {
 
   SyncPoint::GetInstance()->SetCallBack(
       "VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
-        auto* ptr = reinterpret_cast<IOStatus*>(arg);
+        auto* ptr = static_cast<IOStatus*>(arg);
         assert(ptr);
         *ptr = IOStatus::IOError("Injected failure");
       });

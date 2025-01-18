@@ -271,7 +271,7 @@ class FileChecksumTestHelper {
         break;
       }
     }
-    EXPECT_OK(db_->EnableFileDeletions(/*force=*/false));
+    EXPECT_OK(db_->EnableFileDeletions());
     return cs;
   }
 };
@@ -703,7 +703,7 @@ TEST_F(LdbCmdTest, ListFileTombstone) {
 
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
         "ListFileRangeDeletesCommand::DoCommand:BeforePrint", [&](void* arg) {
-          std::string* out_str = reinterpret_cast<std::string*>(arg);
+          std::string* out_str = static_cast<std::string*>(arg);
 
           // Count number of tombstones printed
           int num_tb = 0;
@@ -736,7 +736,7 @@ TEST_F(LdbCmdTest, ListFileTombstone) {
 
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
         "ListFileRangeDeletesCommand::DoCommand:BeforePrint", [&](void* arg) {
-          std::string* out_str = reinterpret_cast<std::string*>(arg);
+          std::string* out_str = static_cast<std::string*>(arg);
 
           // Count number of tombstones printed
           int num_tb = 0;
@@ -796,7 +796,7 @@ TEST_F(LdbCmdTest, DisableConsistencyChecks) {
 
     SyncPoint::GetInstance()->SetCallBack(
         "Version::PrepareAppend:forced_check", [&](void* arg) {
-          bool* forced = reinterpret_cast<bool*>(arg);
+          bool* forced = static_cast<bool*>(arg);
           ASSERT_TRUE(*forced);
         });
     SyncPoint::GetInstance()->EnableProcessing();
@@ -816,7 +816,7 @@ TEST_F(LdbCmdTest, DisableConsistencyChecks) {
 
     SyncPoint::GetInstance()->SetCallBack(
         "Version::PrepareAppend:forced_check", [&](void* arg) {
-          bool* forced = reinterpret_cast<bool*>(arg);
+          bool* forced = static_cast<bool*>(arg);
           ASSERT_TRUE(*forced);
         });
     SyncPoint::GetInstance()->EnableProcessing();
@@ -837,8 +837,7 @@ TEST_F(LdbCmdTest, DisableConsistencyChecks) {
 
     SyncPoint::GetInstance()->SetCallBack(
         "ColumnFamilyData::ColumnFamilyData", [&](void* arg) {
-          ColumnFamilyOptions* cfo =
-              reinterpret_cast<ColumnFamilyOptions*>(arg);
+          ColumnFamilyOptions* cfo = static_cast<ColumnFamilyOptions*>(arg);
           ASSERT_FALSE(cfo->force_consistency_checks);
         });
     SyncPoint::GetInstance()->EnableProcessing();
@@ -1072,7 +1071,7 @@ TEST_F(LdbCmdTest, FileTemperatureUpdateManifest) {
   auto test_fs = std::make_shared<FileTemperatureTestFS>(FileSystem::Default());
   std::unique_ptr<Env> env(new CompositeEnvWrapper(Env::Default(), test_fs));
   Options opts;
-  opts.bottommost_temperature = Temperature::kWarm;
+  opts.last_level_temperature = Temperature::kWarm;
   opts.level0_file_num_compaction_trigger = 10;
   opts.create_if_missing = true;
   opts.env = env.get();
@@ -1232,7 +1231,8 @@ TEST_F(LdbCmdTest, CustomComparator) {
   std::string dbname = test::PerThreadDBPath(env, "ldb_cmd_test");
   DB* db = nullptr;
 
-  std::vector<ColumnFamilyDescriptor> cfds = {{kDefaultColumnFamilyName, opts}};
+  std::vector<ColumnFamilyDescriptor> cfds = {
+      {kDefaultColumnFamilyName, opts}, {"cf1", opts}, {"cf2", opts}};
   std::vector<ColumnFamilyHandle*> handles;
   ASSERT_OK(DestroyDB(dbname, opts));
   ASSERT_OK(DB::Open(opts, dbname, cfds, &handles, &db));
@@ -1250,7 +1250,7 @@ TEST_F(LdbCmdTest, CustomComparator) {
   char* argv[] = {arg1, const_cast<char*>(arg2.c_str()), arg3, arg4};
 
   ASSERT_EQ(0,
-            LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr));
+            LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), &cfds));
 }
 
 }  // namespace ROCKSDB_NAMESPACE

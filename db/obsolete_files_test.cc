@@ -118,7 +118,7 @@ TEST_F(ObsoleteFilesTest, RaceForObsoleteFileDeletion) {
   });
   SyncPoint::GetInstance()->SetCallBack(
       "DBImpl::DeleteObsoleteFileImpl:AfterDeletion", [&](void* arg) {
-        Status* p_status = reinterpret_cast<Status*>(arg);
+        Status* p_status = static_cast<Status*>(arg);
         ASSERT_OK(*p_status);
       });
   SyncPoint::GetInstance()->SetCallBack(
@@ -163,7 +163,7 @@ TEST_F(ObsoleteFilesTest, DeleteObsoleteOptionsFile) {
                                      {{"paranoid_file_checks", "true"}}));
     }
   }
-  ASSERT_OK(dbfull()->EnableFileDeletions(/*force=*/false));
+  ASSERT_OK(dbfull()->EnableFileDeletions());
 
   Close();
 
@@ -194,11 +194,10 @@ TEST_F(ObsoleteFilesTest, BlobFiles) {
   ColumnFamilyData* const cfd = versions->GetColumnFamilySet()->GetDefault();
   assert(cfd);
 
-  const ImmutableCFOptions* const ioptions = cfd->ioptions();
-  assert(ioptions);
-  assert(!ioptions->cf_paths.empty());
+  const auto& cf_paths = cfd->ioptions().cf_paths;
+  assert(!cf_paths.empty());
 
-  const std::string& path = ioptions->cf_paths.front().path;
+  const std::string& path = cf_paths.front().path;
 
   // Add an obsolete blob file.
   constexpr uint64_t first_blob_file_number = 234;
@@ -312,4 +311,3 @@ int main(int argc, char** argv) {
   RegisterCustomObjects(argc, argv);
   return RUN_ALL_TESTS();
 }
-

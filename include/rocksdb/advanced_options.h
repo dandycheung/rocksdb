@@ -61,18 +61,6 @@ enum CompactionPri : char {
   kRoundRobin = 0x4,
 };
 
-// Temperature of a file. Used to pass to FileSystem for a different
-// placement and/or coding.
-// Reserve some numbers in the middle, in case we need to insert new tier
-// there.
-enum class Temperature : uint8_t {
-  kUnknown = 0,
-  kHot = 0x04,
-  kWarm = 0x08,
-  kCold = 0x0C,
-  kLastTemperature,
-};
-
 struct FileTemperatureAge {
   Temperature temperature = Temperature::kUnknown;
   uint64_t age = 0;
@@ -101,7 +89,10 @@ struct CompactionOptionsFIFO {
   // Age (in seconds) threshold for different file temperatures.
   // When not empty, each element specifies an age threshold `age` and a
   // temperature such that if all the data in a file is older than `age`,
-  // RocksDB will compact the file to the specified `temperature`.
+  // RocksDB will compact the file to the specified `temperature`. Oldest file
+  // will be considered first. Only one file is compacted at a time,
+  // so multiple files qualifying to be compacted to be same temperature
+  // won't be merged together.
   //
   // Note:
   // - Flushed files will always have temperature kUnknown.
@@ -229,11 +220,18 @@ struct AdvancedColumnFamilyOptions {
   // if it is not explicitly set by the user.  Otherwise, the default is 0.
   int64_t max_write_buffer_size_to_maintain = 0;
 
-  // Allows thread-safe inplace updates. If this is true, there is no way to
+  // Allows thread-safe inplace updates.
+  //
+  // If this is true, there is no way to
   // achieve point-in-time consistency using snapshot or iterator (assuming
   // concurrent updates). Hence iterator and multi-get will return results
   // which are not consistent as of any point-in-time.
+  //
   // Backward iteration on memtables will not work either.
+  //
+  // It is intended to work or be compatible with a limited set of features:
+  // (1) Non-snapshot Get()
+  //
   // If inplace_callback function is not set,
   //   Put(key, new_value) will update inplace the existing_value iff
   //   * key exists in current memtable
@@ -547,15 +545,6 @@ struct AdvancedColumnFamilyOptions {
   // Default: true
   bool level_compaction_dynamic_level_bytes = true;
 
-  // Allows RocksDB to generate files that are not exactly the target_file_size
-  // only for the non-bottommost files. Which can reduce the write-amplification
-  // from compaction. The file size could be from 0 to 2x target_file_size.
-  // Once enabled, non-bottommost compaction will try to cut the files align
-  // with the next level file boundaries (grandparent level).
-  //
-  // Default: true
-  bool level_compaction_dynamic_file_size = true;
-
   // Default: 10.
   //
   // Dynamically changeable through SetOptions() API
@@ -581,17 +570,6 @@ struct AdvancedColumnFamilyOptions {
   //
   // Dynamically changeable through SetOptions() API
   uint64_t max_compaction_bytes = 0;
-
-  // When setting up compaction input files, we ignore the
-  // `max_compaction_bytes` limit when pulling in input files that are entirely
-  // within output key range.
-  //
-  // Default: true
-  //
-  // Dynamically changeable through SetOptions() API
-  // We could remove this knob and always ignore the limit once it is proven
-  // safe.
-  bool ignore_max_compaction_bytes_for_input = true;
 
   // All writes will be slowed down to at least delayed_write_rate if estimated
   // bytes needed to be compaction exceed this threshold.
@@ -669,17 +647,28 @@ struct AdvancedColumnFamilyOptions {
   TablePropertiesCollectorFactories table_properties_collector_factories;
 
   // Maximum number of successive merge operations on a key in the memtable.
+  // It may be violated when filesystem reads would be needed to stay under the
+  // limit, unless `strict_max_successive_merges` is explicitly set.
   //
   // When a merge operation is added to the memtable and the maximum number of
-  // successive merges is reached, the value of the key will be calculated and
-  // inserted into the memtable instead of the merge operation. This will
-  // ensure that there are never more than max_successive_merges merge
-  // operations in the memtable.
+  // successive merges is reached, RocksDB will attempt to read the value. Upon
+  // success, the value will be inserted into the memtable instead of the merge
+  // operation.
   //
   // Default: 0 (disabled)
   //
   // Dynamically changeable through SetOptions() API
   size_t max_successive_merges = 0;
+
+  // Whether to allow filesystem reads to stay under the `max_successive_merges`
+  // limit. When true, this can lead to merge writes blocking the write path
+  // waiting on filesystem reads.
+  //
+  // This option is temporary in case the recent change to disallow filesystem
+  // reads during merge writes has a problem and users need to undo it quickly.
+  //
+  // Default: false
+  bool strict_max_successive_merges = false;
 
   // This flag specifies that the implementation should optimize the filters
   // mainly for cases where keys are found rather than also optimize for keys
@@ -696,14 +685,6 @@ struct AdvancedColumnFamilyOptions {
   //
   // Default: false
   bool optimize_filters_for_hits = false;
-
-  // During flush or compaction, check whether keys inserted to output files
-  // are in order.
-  //
-  // Default: true
-  //
-  // Dynamically changeable through SetOptions() API
-  bool check_flush_compaction_key_order = true;
 
   // After writing every SST file, reopen it and read all the keys.
   // Checks the hash of all of the keys and values written versus the
@@ -820,27 +801,28 @@ struct AdvancedColumnFamilyOptions {
   uint64_t sample_for_compression = 0;
 
   // EXPERIMENTAL
-  // The feature is still in development and is incomplete.
   // If this option is set, when creating the last level files, pass this
   // temperature to FileSystem used. Should be no-op for default FileSystem
   // and users need to plug in their own FileSystem to take advantage of it.
-  //
-  // Note: the feature is changed from `bottommost_temperature` to
-  //  `last_level_temperature` which now only apply for the last level files.
-  //  The option name `bottommost_temperature` is kept only for migration, the
-  //  behavior is the same as `last_level_temperature`. Please stop using
-  //  `bottommost_temperature` and will be removed in next release.
+  // Currently only compatible with universal compaction.
   //
   // Dynamically changeable through the SetOptions() API
-  Temperature bottommost_temperature = Temperature::kUnknown;
   Temperature last_level_temperature = Temperature::kUnknown;
+
+  // EXPERIMENTAL
+  // When no other option such as last_level_temperature determines the
+  // temperature of a new SST file, it will be written with this temperature,
+  // which can be set differently for each column family.
+  //
+  // Dynamically changeable through the SetOptions() API
+  Temperature default_write_temperature = Temperature::kUnknown;
 
   // EXPERIMENTAL
   // When this field is set, all SST files without an explicitly set temperature
   // will be treated as if they have this temperature for file reading
   // accounting purpose, such as io statistics, io perf context.
   //
-  // Not dynamically changeable, change it requires db restart.
+  // Not dynamically changeable; change requires DB restart.
   Temperature default_temperature = Temperature::kUnknown;
 
   // EXPERIMENTAL
@@ -950,13 +932,12 @@ struct AdvancedColumnFamilyOptions {
   // Dynamically changeable through the SetOptions() API
   double blob_garbage_collection_age_cutoff = 0.25;
 
-  // If the ratio of garbage in the oldest blob files exceeds this threshold,
-  // targeted compactions are scheduled in order to force garbage collecting
-  // the blob files in question, assuming they are all eligible based on the
-  // value of blob_garbage_collection_age_cutoff above. This option is
-  // currently only supported with leveled compactions.
-  // Note that enable_blob_garbage_collection has to be set in order for this
-  // option to have any effect.
+  // If the ratio of garbage in the blob files currently eligible for garbage
+  // collection exceeds this threshold, targeted compactions are scheduled in
+  // order to force garbage collecting the oldest blob files. This option is
+  // currently only supported with leveled compactions. Note that
+  // enable_blob_garbage_collection has to be set in order for this option to
+  // have any effect.
   //
   // Default: 1.0
   //
@@ -1046,8 +1027,10 @@ struct AdvancedColumnFamilyOptions {
   // When setting this flag to `false`, users should also call
   // `DB::IncreaseFullHistoryTsLow` to set a cutoff timestamp for flush. RocksDB
   // refrains from flushing a memtable with data still above
-  // the cutoff timestamp with best effort. If this cutoff timestamp is not set,
-  // flushing continues normally.
+  // the cutoff timestamp with best effort. One limitation of this best effort
+  // is that when `max_write_buffer_number` is equal to or smaller than 2,
+  // RocksDB will not attempt to retain user-defined timestamps, all flush jobs
+  // continue normally.
   //
   // Users can do user-defined
   // multi-versioned read above the cutoff timestamp. When users try to read
@@ -1096,6 +1079,13 @@ struct AdvancedColumnFamilyOptions {
   // Default: 0 (no delay)
   // Dynamically changeable through the SetOptions() API.
   uint32_t bottommost_file_compaction_delay = 0;
+
+  // Enables additional integrity checks during reads/scans.
+  // Specifically, for skiplist-based memtables, we verify that keys visited
+  // are in order. This is helpful to detect corrupted memtable keys during
+  // reads. Enabling this feature incurs a performance overhead due to an
+  // additional key comparison during memtable lookup.
+  bool paranoid_memory_checks = false;
 
   // Create ColumnFamilyOptions with default values for all fields
   AdvancedColumnFamilyOptions();

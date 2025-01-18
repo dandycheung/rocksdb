@@ -25,7 +25,7 @@ class Statistics;
 class HistogramImpl;
 class SystemClock;
 
-using AlignedBuf = std::unique_ptr<char[]>;
+using AlignedBuf = FSAllocationPtr;
 
 // Align the request r according to alignment and return the aligned result.
 FSReadRequest Align(const FSReadRequest& r, size_t alignment);
@@ -76,7 +76,6 @@ class RandomAccessFileReader {
     io_status.PermitUncheckedError();
   }
 
-
   bool ShouldNotifyListeners() const { return !listeners_.empty(); }
 
   FSRandomAccessFilePtr file_;
@@ -91,8 +90,8 @@ class RandomAccessFileReader {
   const bool is_last_level_;
 
   struct ReadAsyncInfo {
-    ReadAsyncInfo(std::function<void(const FSReadRequest&, void*)> cb,
-                  void* cb_arg, uint64_t start_time)
+    ReadAsyncInfo(std::function<void(FSReadRequest&, void*)> cb, void* cb_arg,
+                  uint64_t start_time)
         : cb_(cb),
           cb_arg_(cb_arg),
           start_time_(start_time),
@@ -102,7 +101,7 @@ class RandomAccessFileReader {
           user_len_(0),
           is_aligned_(false) {}
 
-    std::function<void(const FSReadRequest&, void*)> cb_;
+    std::function<void(FSReadRequest&, void*)> cb_;
     void* cb_arg_;
     uint64_t start_time_;
     FileOperationInfo::StartTimePoint fs_start_ts_;
@@ -188,10 +187,10 @@ class RandomAccessFileReader {
   IOStatus PrepareIOOptions(const ReadOptions& ro, IOOptions& opts) const;
 
   IOStatus ReadAsync(FSReadRequest& req, const IOOptions& opts,
-                     std::function<void(const FSReadRequest&, void*)> cb,
+                     std::function<void(FSReadRequest&, void*)> cb,
                      void* cb_arg, void** io_handle, IOHandleDeleter* del_fn,
                      AlignedBuf* aligned_buf);
 
-  void ReadAsyncCallback(const FSReadRequest& req, void* cb_arg);
+  void ReadAsyncCallback(FSReadRequest& req, void* cb_arg);
 };
 }  // namespace ROCKSDB_NAMESPACE

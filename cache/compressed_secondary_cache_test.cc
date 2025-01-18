@@ -33,12 +33,14 @@ const std::string key3 = "____    ____key3";
 class CompressedSecondaryCacheTestBase : public testing::Test,
                                          public WithCacheType {
  public:
-  CompressedSecondaryCacheTestBase() {}
+  CompressedSecondaryCacheTestBase() = default;
   ~CompressedSecondaryCacheTestBase() override = default;
 
  protected:
   void BasicTestHelper(std::shared_ptr<SecondaryCache> sec_cache,
                        bool sec_cache_is_compressed) {
+    CompressedSecondaryCache* comp_sec_cache =
+        static_cast<CompressedSecondaryCache*>(sec_cache.get());
     get_perf_context()->Reset();
     bool kept_in_sec_cache{true};
     // Lookup an non-existent key.
@@ -65,6 +67,8 @@ class CompressedSecondaryCacheTestBase : public testing::Test,
     // Insert and Lookup the item k1 for the second time and advise erasing it.
     ASSERT_OK(sec_cache->Insert(key1, &item1, GetHelper(), false));
     ASSERT_EQ(get_perf_context()->compressed_sec_cache_insert_real_count, 1);
+
+    ASSERT_GT(comp_sec_cache->TEST_GetCharge(key1), 1000);
 
     std::unique_ptr<SecondaryCacheResultHandle> handle1_2 =
         sec_cache->Lookup(key1, GetHelper(), this, true, /*advise_erase=*/true,
@@ -841,7 +845,6 @@ TEST_P(CompressedSecondaryCacheTestWithCompressionParam,
   BasicTestHelper(sec_cache, sec_cache_is_compressed_);
 }
 
-
 TEST_P(CompressedSecondaryCacheTestWithCompressionParam, FailsTest) {
   FailsTest(sec_cache_is_compressed_);
 }
@@ -1062,7 +1065,7 @@ bool CacheUsageWithinBounds(size_t val1, size_t val2, size_t error) {
 
 TEST_P(CompressedSecCacheTestWithTiered, CacheReservationManager) {
   CompressedSecondaryCache* sec_cache =
-      reinterpret_cast<CompressedSecondaryCache*>(GetSecondaryCache());
+      static_cast<CompressedSecondaryCache*>(GetSecondaryCache());
 
   // Use EXPECT_PRED3 instead of EXPECT_NEAR to void too many size_t to
   // double explicit casts
@@ -1085,7 +1088,7 @@ TEST_P(CompressedSecCacheTestWithTiered, CacheReservationManager) {
 TEST_P(CompressedSecCacheTestWithTiered,
        CacheReservationManagerMultipleUpdate) {
   CompressedSecondaryCache* sec_cache =
-      reinterpret_cast<CompressedSecondaryCache*>(GetSecondaryCache());
+      static_cast<CompressedSecondaryCache*>(GetSecondaryCache());
 
   EXPECT_PRED3(CacheUsageWithinBounds, GetCache()->GetUsage(), (30 << 20),
                GetPercent(30 << 20, 1));
@@ -1171,7 +1174,7 @@ TEST_P(CompressedSecCacheTestWithTiered, AdmissionPolicy) {
 
 TEST_P(CompressedSecCacheTestWithTiered, DynamicUpdate) {
   CompressedSecondaryCache* sec_cache =
-      reinterpret_cast<CompressedSecondaryCache*>(GetSecondaryCache());
+      static_cast<CompressedSecondaryCache*>(GetSecondaryCache());
   std::shared_ptr<Cache> tiered_cache = GetTieredCache();
 
   // Use EXPECT_PRED3 instead of EXPECT_NEAR to void too many size_t to
@@ -1235,7 +1238,7 @@ TEST_P(CompressedSecCacheTestWithTiered, DynamicUpdate) {
 
 TEST_P(CompressedSecCacheTestWithTiered, DynamicUpdateWithReservation) {
   CompressedSecondaryCache* sec_cache =
-      reinterpret_cast<CompressedSecondaryCache*>(GetSecondaryCache());
+      static_cast<CompressedSecondaryCache*>(GetSecondaryCache());
   std::shared_ptr<Cache> tiered_cache = GetTieredCache();
 
   ASSERT_OK(cache_res_mgr()->UpdateCacheReservation(10 << 20));
@@ -1329,7 +1332,7 @@ TEST_P(CompressedSecCacheTestWithTiered, DynamicUpdateWithReservation) {
 
 TEST_P(CompressedSecCacheTestWithTiered, ReservationOverCapacity) {
   CompressedSecondaryCache* sec_cache =
-      reinterpret_cast<CompressedSecondaryCache*>(GetSecondaryCache());
+      static_cast<CompressedSecondaryCache*>(GetSecondaryCache());
   std::shared_ptr<Cache> tiered_cache = GetTieredCache();
 
   ASSERT_OK(cache_res_mgr()->UpdateCacheReservation(110 << 20));

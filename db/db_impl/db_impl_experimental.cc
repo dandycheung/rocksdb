@@ -45,9 +45,9 @@ Status DBImpl::SuggestCompactRange(ColumnFamilyHandle* column_family,
     }
     // Since we have some more files to compact, we should also recompute
     // compaction score
-    vstorage->ComputeCompactionScore(*cfd->ioptions(),
-                                     *cfd->GetLatestMutableCFOptions());
-    SchedulePendingCompaction(cfd);
+    vstorage->ComputeCompactionScore(cfd->ioptions(),
+                                     cfd->GetLatestMutableCFOptions());
+    EnqueuePendingCompaction(cfd);
     MaybeScheduleFlushOrCompaction();
   }
   return Status::OK();
@@ -104,7 +104,9 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
         return status;
       }
 
-      if (i == 0) continue;
+      if (i == 0) {
+        continue;
+      }
       auto prev_f = l0_files[i - 1];
       if (icmp->Compare(prev_f->largest, f->smallest) >= 0) {
         ROCKS_LOG_INFO(immutable_db_options_.info_log,
@@ -144,13 +146,11 @@ Status DBImpl::PromoteL0(ColumnFamilyHandle* column_family, int target_level) {
                    f->user_defined_timestamps_persisted);
     }
 
-    status = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(),
-                                    read_options, write_options, &edit, &mutex_,
-                                    directories_.GetDbDir());
+    status = versions_->LogAndApply(cfd, read_options, write_options, &edit,
+                                    &mutex_, directories_.GetDbDir());
     if (status.ok()) {
-      InstallSuperVersionAndScheduleWork(cfd,
-                                         &job_context.superversion_contexts[0],
-                                         *cfd->GetLatestMutableCFOptions());
+      InstallSuperVersionAndScheduleWork(
+          cfd, job_context.superversion_contexts.data());
     }
   }  // lock released here
   LogFlush(immutable_db_options_.info_log);

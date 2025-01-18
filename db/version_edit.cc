@@ -193,11 +193,13 @@ bool VersionEdit::EncodeTo(std::string* dst,
     PutVarint64(&varint_epoch_number, f.epoch_number);
     PutLengthPrefixedSlice(dst, Slice(varint_epoch_number));
 
-    PutVarint32(dst, NewFileCustomTag::kFileChecksum);
-    PutLengthPrefixedSlice(dst, Slice(f.file_checksum));
+    if (f.file_checksum_func_name != kUnknownFileChecksumFuncName) {
+      PutVarint32(dst, NewFileCustomTag::kFileChecksum);
+      PutLengthPrefixedSlice(dst, Slice(f.file_checksum));
 
-    PutVarint32(dst, NewFileCustomTag::kFileChecksumFuncName);
-    PutLengthPrefixedSlice(dst, Slice(f.file_checksum_func_name));
+      PutVarint32(dst, NewFileCustomTag::kFileChecksumFuncName);
+      PutLengthPrefixedSlice(dst, Slice(f.file_checksum_func_name));
+    }
 
     if (f.fd.GetPathId() != 0) {
       PutVarint32(dst, NewFileCustomTag::kPathId);
@@ -255,7 +257,6 @@ bool VersionEdit::EncodeTo(std::string* dst,
       char p = static_cast<char>(0);
       PutLengthPrefixedSlice(dst, Slice(&p, 1));
     }
-
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                              dst);
 
@@ -484,7 +485,7 @@ void VersionEdit::EncodeFileBoundaries(std::string* dst,
   StripTimestampFromInternalKey(&largest_buf, meta.largest.Encode(), ts_sz);
   PutLengthPrefixedSlice(dst, smallest_buf);
   PutLengthPrefixedSlice(dst, largest_buf);
-};
+}
 
 Status VersionEdit::DecodeFrom(const Slice& src) {
   Clear();

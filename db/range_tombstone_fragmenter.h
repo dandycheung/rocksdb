@@ -17,16 +17,6 @@
 #include "table/internal_iterator.h"
 
 namespace ROCKSDB_NAMESPACE {
-struct FragmentedRangeTombstoneList;
-
-struct FragmentedRangeTombstoneListCache {
-  // ensure only the first reader needs to initialize l
-  std::mutex reader_mutex;
-  std::unique_ptr<FragmentedRangeTombstoneList> tombstones = nullptr;
-  // readers will first check this bool to avoid
-  std::atomic<bool> initialized = false;
-};
-
 struct FragmentedRangeTombstoneList {
  public:
   // A compact representation of a "stack" of range tombstone fragments, which
@@ -54,7 +44,8 @@ struct FragmentedRangeTombstoneList {
   FragmentedRangeTombstoneList(
       std::unique_ptr<InternalIterator> unfragmented_tombstones,
       const InternalKeyComparator& icmp, bool for_compaction = false,
-      const std::vector<SequenceNumber>& snapshots = {});
+      const std::vector<SequenceNumber>& snapshots = {},
+      const bool tombstone_end_include_ts = true);
 
   std::vector<RangeTombstoneStack>::const_iterator begin() const {
     return tombstones_.begin();
@@ -121,6 +112,14 @@ struct FragmentedRangeTombstoneList {
   PinnedIteratorsManager pinned_iters_mgr_;
   uint64_t num_unfragmented_tombstones_;
   uint64_t total_tombstone_payload_bytes_;
+};
+
+struct FragmentedRangeTombstoneListCache {
+  // ensure only the first reader needs to initialize l
+  std::mutex reader_mutex;
+  std::unique_ptr<FragmentedRangeTombstoneList> tombstones = nullptr;
+  // readers will first check this bool to avoid
+  std::atomic<bool> initialized = false;
 };
 
 // FragmentedRangeTombstoneIterator converts an InternalIterator of a range-del
@@ -205,6 +204,7 @@ class FragmentedRangeTombstoneIterator : public InternalIterator {
     }
     return RangeTombstone(start_key(), end_key(), seq());
   }
+
   // Note that start_key() and end_key() are not guaranteed to have the
   // correct timestamp. User can call timestamp() to get the correct
   // timestamp().

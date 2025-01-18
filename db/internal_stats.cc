@@ -16,6 +16,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,7 +33,6 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
-
 
 const std::map<LevelStatType, LevelStat> InternalStats::compaction_level_stats =
     {
@@ -924,7 +924,7 @@ bool InternalStats::HandleLiveBlobFileGarbageSize(uint64_t* value,
 }
 
 Cache* InternalStats::GetBlobCacheForStats() {
-  return cfd_->ioptions()->blob_cache.get();
+  return cfd_->ioptions().blob_cache.get();
 }
 
 bool InternalStats::HandleBlobCacheCapacity(uint64_t* value, DBImpl* /*db*/,
@@ -1301,7 +1301,7 @@ bool InternalStats::HandleNumEntriesActiveMemTable(uint64_t* value,
                                                    DBImpl* /*db*/,
                                                    Version* /*version*/) {
   // Current number of entires in the active memtable
-  *value = cfd_->mem()->num_entries();
+  *value = cfd_->mem()->NumEntries();
   return true;
 }
 
@@ -1317,7 +1317,7 @@ bool InternalStats::HandleNumDeletesActiveMemTable(uint64_t* value,
                                                    DBImpl* /*db*/,
                                                    Version* /*version*/) {
   // Current number of entires in the active memtable
-  *value = cfd_->mem()->num_deletes();
+  *value = cfd_->mem()->NumDeletion();
   return true;
 }
 
@@ -1334,11 +1334,11 @@ bool InternalStats::HandleEstimateNumKeys(uint64_t* value, DBImpl* /*db*/,
   // Estimate number of entries in the column family:
   // Use estimated entries in tables + total entries in memtables.
   const auto* vstorage = cfd_->current()->storage_info();
-  uint64_t estimate_keys = cfd_->mem()->num_entries() +
+  uint64_t estimate_keys = cfd_->mem()->NumEntries() +
                            cfd_->imm()->current()->GetTotalNumEntries() +
                            vstorage->GetEstimatedActiveKeys();
   uint64_t estimate_deletes =
-      cfd_->mem()->num_deletes() + cfd_->imm()->current()->GetTotalNumDeletes();
+      cfd_->mem()->NumDeletion() + cfd_->imm()->current()->GetTotalNumDeletes();
   *value = estimate_keys > estimate_deletes * 2
                ? estimate_keys - (estimate_deletes * 2)
                : 0;
@@ -1468,9 +1468,9 @@ bool InternalStats::HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* /*db*/,
   // TODO(yiwu): The property is currently available for fifo compaction
   // with allow_compaction = false. This is because we don't propagate
   // oldest_key_time on compaction.
-  if (cfd_->ioptions()->compaction_style != kCompactionStyleFIFO ||
+  if (cfd_->ioptions().compaction_style != kCompactionStyleFIFO ||
       cfd_->GetCurrentMutableCFOptions()
-          ->compaction_options_fifo.allow_compaction) {
+          .compaction_options_fifo.allow_compaction) {
     return false;
   }
   // TODO: plumb Env::IOActivity, Env::IOPriority
@@ -1495,8 +1495,10 @@ bool InternalStats::HandleEstimateOldestKeyTime(uint64_t* value, DBImpl* /*db*/,
 }
 
 Cache* InternalStats::GetBlockCacheForStats() {
-  auto* table_factory = cfd_->ioptions()->table_factory.get();
+  // NOTE: called in startup before GetCurrentMutableCFOptions() is ready
+  auto* table_factory = cfd_->GetLatestMutableCFOptions().table_factory.get();
   assert(table_factory != nullptr);
+  // FIXME: need to a shared_ptr if/when block_cache is going to be mutable
   return table_factory->GetOptions<Cache>(TableFactory::kBlockCacheOpts());
 }
 
@@ -1750,7 +1752,7 @@ void InternalStats::DumpCFMapStats(
   assert(vstorage);
 
   int num_levels_to_check =
-      (cfd_->ioptions()->compaction_style == kCompactionStyleLevel)
+      (cfd_->ioptions().compaction_style == kCompactionStyleLevel)
           ? vstorage->num_levels() - 1
           : 1;
 
@@ -2067,6 +2069,12 @@ void InternalStats::DumpCFStatsNoFileHistogram(bool is_periodic,
       interval_compact_bytes_read / kMB / std::max(interval_seconds_up, 0.001),
       interval_compact_micros / kMicrosInSec);
   value->append(buf);
+
+  snprintf(buf, sizeof(buf),
+           "Estimated pending compaction bytes: %" PRIu64 "\n",
+           vstorage->estimated_compaction_needed_bytes());
+  value->append(buf);
+
   if (is_periodic) {
     cf_stats_snapshot_.compact_bytes_write = compact_bytes_write;
     cf_stats_snapshot_.compact_bytes_read = compact_bytes_read;
@@ -2129,5 +2137,64 @@ void InternalStats::DumpCFFileHistogram(std::string* value) {
   value->append(oss.str());
 }
 
+namespace {
+
+class SumPropertyAggregator : public IntPropertyAggregator {
+ public:
+  SumPropertyAggregator() : aggregated_value_(0) {}
+  virtual ~SumPropertyAggregator() override = default;
+
+  void Add(ColumnFamilyData* cfd, uint64_t value) override {
+    (void)cfd;
+    aggregated_value_ += value;
+  }
+
+  uint64_t Aggregate() const override { return aggregated_value_; }
+
+ private:
+  uint64_t aggregated_value_;
+};
+
+// A block cache may be shared by multiple column families.
+// BlockCachePropertyAggregator ensures that the same cache is only added once.
+class BlockCachePropertyAggregator : public IntPropertyAggregator {
+ public:
+  BlockCachePropertyAggregator() = default;
+  virtual ~BlockCachePropertyAggregator() override = default;
+
+  void Add(ColumnFamilyData* cfd, uint64_t value) override {
+    auto* table_factory = cfd->GetCurrentMutableCFOptions().table_factory.get();
+    assert(table_factory != nullptr);
+    Cache* cache =
+        table_factory->GetOptions<Cache>(TableFactory::kBlockCacheOpts());
+    if (cache != nullptr) {
+      block_cache_properties_.emplace(cache, value);
+    }
+  }
+
+  uint64_t Aggregate() const override {
+    uint64_t sum = 0;
+    for (const auto& p : block_cache_properties_) {
+      sum += p.second;
+    }
+    return sum;
+  }
+
+ private:
+  std::unordered_map<Cache*, uint64_t> block_cache_properties_;
+};
+
+}  // anonymous namespace
+
+std::unique_ptr<IntPropertyAggregator> CreateIntPropertyAggregator(
+    const Slice& property) {
+  if (property == DB::Properties::kBlockCacheCapacity ||
+      property == DB::Properties::kBlockCacheUsage ||
+      property == DB::Properties::kBlockCachePinnedUsage) {
+    return std::make_unique<BlockCachePropertyAggregator>();
+  } else {
+    return std::make_unique<SumPropertyAggregator>();
+  }
+}
 
 }  // namespace ROCKSDB_NAMESPACE

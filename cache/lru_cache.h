@@ -47,7 +47,7 @@ namespace lru_cache {
 // LRUCacheShard::Lookup.
 // While refs > 0, public properties like value and deleter must not change.
 
-struct LRUHandle {
+struct LRUHandle : public Cache::Handle {
   Cache::ObjectPtr value;
   const Cache::CacheItemHelper* helper;
   LRUHandle* next_hash;
@@ -451,6 +451,12 @@ class LRUCache
   ObjectPtr Value(Handle* handle) override;
   size_t GetCharge(Handle* handle) const override;
   const CacheItemHelper* GetCacheItemHelper(Handle* handle) const override;
+
+  void ApplyToHandle(
+      Cache* cache, Handle* handle,
+      const std::function<void(const Slice& key, ObjectPtr obj, size_t charge,
+                               const CacheItemHelper* helper)>& callback)
+      override;
 
   // Retrieves number of elements in LRU, for unit test purpose only.
   size_t TEST_GetLRUSize();

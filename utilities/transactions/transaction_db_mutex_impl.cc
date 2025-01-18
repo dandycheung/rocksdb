@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/transactions/transaction_db_mutex_impl.h"
 
 #include <chrono>
@@ -17,8 +16,8 @@ namespace ROCKSDB_NAMESPACE {
 
 class TransactionDBMutexImpl : public TransactionDBMutex {
  public:
-  TransactionDBMutexImpl() {}
-  ~TransactionDBMutexImpl() override {}
+  TransactionDBMutexImpl() = default;
+  ~TransactionDBMutexImpl() override = default;
 
   Status Lock() override;
 
@@ -34,8 +33,8 @@ class TransactionDBMutexImpl : public TransactionDBMutex {
 
 class TransactionDBCondVarImpl : public TransactionDBCondVar {
  public:
-  TransactionDBCondVarImpl() {}
-  ~TransactionDBCondVarImpl() override {}
+  TransactionDBCondVarImpl() = default;
+  ~TransactionDBCondVarImpl() override = default;
 
   Status Wait(std::shared_ptr<TransactionDBMutex> mutex) override;
 
@@ -91,7 +90,7 @@ Status TransactionDBMutexImpl::TryLockFor(int64_t timeout_time) {
 
 Status TransactionDBCondVarImpl::Wait(
     std::shared_ptr<TransactionDBMutex> mutex) {
-  auto mutex_impl = reinterpret_cast<TransactionDBMutexImpl*>(mutex.get());
+  auto mutex_impl = static_cast<TransactionDBMutexImpl*>(mutex.get());
 
   std::unique_lock<std::mutex> lock(mutex_impl->mutex_, std::adopt_lock);
   cv_.wait(lock);
@@ -106,7 +105,7 @@ Status TransactionDBCondVarImpl::WaitFor(
     std::shared_ptr<TransactionDBMutex> mutex, int64_t timeout_time) {
   Status s;
 
-  auto mutex_impl = reinterpret_cast<TransactionDBMutexImpl*>(mutex.get());
+  auto mutex_impl = static_cast<TransactionDBMutexImpl*>(mutex.get());
   std::unique_lock<std::mutex> lock(mutex_impl->mutex_, std::adopt_lock);
 
   if (timeout_time < 0) {
@@ -130,4 +129,3 @@ Status TransactionDBCondVarImpl::WaitFor(
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-

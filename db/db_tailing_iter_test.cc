@@ -203,13 +203,13 @@ TEST_P(DBTestTailingIterator, TailingIteratorTrimSeekToNext) {
   bool file_iters_renewed_copy = false;
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "ForwardIterator::SeekInternal:Return", [&](void* arg) {
-        ForwardIterator* fiter = reinterpret_cast<ForwardIterator*>(arg);
+        ForwardIterator* fiter = static_cast<ForwardIterator*>(arg);
         ASSERT_TRUE(!file_iters_deleted ||
                     fiter->TEST_CheckDeletedIters(&deleted_iters, &num_iters));
       });
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
       "ForwardIterator::Next:Return", [&](void* arg) {
-        ForwardIterator* fiter = reinterpret_cast<ForwardIterator*>(arg);
+        ForwardIterator* fiter = static_cast<ForwardIterator*>(arg);
         ASSERT_TRUE(!file_iters_deleted ||
                     fiter->TEST_CheckDeletedIters(&deleted_iters, &num_iters));
       });
@@ -702,7 +702,6 @@ TEST_P(DBTestTailingIterator, SeekToFirstWithUpperBoundBug) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
-
 
 int main(int argc, char** argv) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();

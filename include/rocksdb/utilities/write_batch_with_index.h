@@ -74,6 +74,10 @@ class WBWIIterator {
   // WriteBatchWithIndex
   virtual WriteEntry Entry() const = 0;
 
+  // For this user key, there is a single delete in this write batch,
+  // and it was overwritten by another update.
+  virtual bool HasOverWrittenSingleDel() const { return false; }
+
   virtual Status status() const = 0;
 };
 
@@ -130,7 +134,7 @@ class WriteBatchWithIndex : public WriteBatchBase {
           "Cannot call this method without attribute groups");
     }
     return Status::NotSupported(
-        "PutEntity not supported by WriteBatchWithIndex");
+        "PutEntity with AttributeGroups not supported by WriteBatchWithIndex");
   }
 
   using WriteBatchBase::Merge;
@@ -188,8 +192,10 @@ class WriteBatchWithIndex : public WriteBatchBase {
   // Create an iterator of a column family. User can call iterator.Seek() to
   // search to the next entry of or after a key. Keys will be iterated in the
   // order given by index_comparator. For multiple updates on the same key,
-  // each update will be returned as a separate entry, in the order of update
-  // time.
+  // if overwrite_key=false, then each update will be returned as a separate
+  // entry, in the order of update time.
+  // if overwrite_key=true, then one entry per key will be returned. Merge
+  // updates on the same key will be returned as separate entries.
   //
   // The returned iterator should be deleted by the caller.
   WBWIIterator* NewIterator(ColumnFamilyHandle* column_family);
@@ -229,7 +235,18 @@ class WriteBatchWithIndex : public WriteBatchBase {
     return GetFromBatch(nullptr, options, key, value);
   }
 
-  // TODO: implement GetEntityFromBatch
+  // If the batch contains an entry for "key" in "column_family", return it as a
+  // wide-column entity in "*columns". If the entry is a wide-column entity,
+  // return it as-is; if it is a plain key-value, return it as an entity with a
+  // single anonymous column (see kDefaultWideColumnName) which contains the
+  // value.
+  //
+  // Returns OK on success, NotFound if the there is no mapping for "key",
+  // MergeInProgress if the key has merge operands but the base value cannot be
+  // resolved based on the batch, or some error status (e.g. Corruption
+  // or InvalidArgument) on failure.
+  Status GetEntityFromBatch(ColumnFamilyHandle* column_family, const Slice& key,
+                            PinnableWideColumns* columns);
 
   // Similar to DB::Get() but will also read writes from this batch.
   //
@@ -257,7 +274,28 @@ class WriteBatchWithIndex : public WriteBatchBase {
                            ColumnFamilyHandle* column_family, const Slice& key,
                            PinnableSlice* value);
 
-  // TODO: implement GetEntityFromBatchAndDB
+  // Similar to DB::GetEntity() but also reads writes from this batch.
+  //
+  // This method queries the batch for the key and if the result can be
+  // determined based on the batch alone, it is returned (assuming the key is
+  // found, in the form of a wide-column entity). If the batch does not contain
+  // enough information to determine the result (the key is not present in the
+  // batch at all or a merge is in progress), the DB is queried and the result
+  // is merged with the entries from the batch if necessary.
+  //
+  // Setting read_options.snapshot will affect what is read from the DB
+  // but will NOT change which keys are read from the batch (the keys in
+  // this batch do not yet belong to any snapshot and will be fetched
+  // regardless).
+  Status GetEntityFromBatchAndDB(DB* db, const ReadOptions& read_options,
+                                 ColumnFamilyHandle* column_family,
+                                 const Slice& key,
+                                 PinnableWideColumns* columns) {
+    constexpr ReadCallback* callback = nullptr;
+
+    return GetEntityFromBatchAndDB(db, read_options, column_family, key,
+                                   columns, callback);
+  }
 
   void MultiGetFromBatchAndDB(DB* db, const ReadOptions& read_options,
                               ColumnFamilyHandle* column_family,
@@ -265,7 +303,31 @@ class WriteBatchWithIndex : public WriteBatchBase {
                               PinnableSlice* values, Status* statuses,
                               bool sorted_input);
 
-  // TODO: implement MultiGetEntityFromBatchAndDB
+  // Similar to DB::MultiGetEntity() but also reads writes from this batch.
+  //
+  // For each key, this method queries the batch and if the result can be
+  // determined based on the batch alone, it is returned in the appropriate
+  // PinnableWideColumns object (assuming the key is found). For all keys for
+  // which the batch does not contain enough information to determine the result
+  // (the key is not present in the batch at all or a merge is in progress), the
+  // DB is queried and the result is merged with the entries from the batch if
+  // necessary.
+  //
+  // Setting read_options.snapshot will affect what is read from the DB
+  // but will NOT change which keys are read from the batch (the keys in
+  // this batch do not yet belong to any snapshot and will be fetched
+  // regardless).
+  void MultiGetEntityFromBatchAndDB(DB* db, const ReadOptions& read_options,
+                                    ColumnFamilyHandle* column_family,
+                                    size_t num_keys, const Slice* keys,
+                                    PinnableWideColumns* results,
+                                    Status* statuses, bool sorted_input) {
+    constexpr ReadCallback* callback = nullptr;
+
+    MultiGetEntityFromBatchAndDB(db, read_options, column_family, num_keys,
+                                 keys, results, statuses, sorted_input,
+                                 callback);
+  }
 
   // Records the state of the batch for future calls to RollbackToSavePoint().
   // May be called multiple times to set multiple save points.
@@ -292,22 +354,49 @@ class WriteBatchWithIndex : public WriteBatchBase {
   void SetMaxBytes(size_t max_bytes) override;
   size_t GetDataSize() const;
 
+  struct CFStat {
+    uint32_t entry_count = 0;
+    uint32_t overwritten_sd_count = 0;
+  };
+  // Will track CF ID, per CF entry count and overwritten sd count.
+  // Should be enabled when WBWI is empty for correct tracking.
+  void SetTrackPerCFStat(bool track);
+  const std::unordered_map<uint32_t, CFStat>& GetCFStats() const;
+
+  bool GetOverwriteKey() const;
+
  private:
   friend class PessimisticTransactionDB;
   friend class WritePreparedTxn;
   friend class WriteUnpreparedTxn;
   friend class WriteBatchWithIndex_SubBatchCnt_Test;
   friend class WriteBatchWithIndexInternal;
+  friend class WBWIMemTable;
+
+  WBWIIterator* NewIterator(uint32_t cf_id) const;
+
   // Returns the number of sub-batches inside the write batch. A sub-batch
   // starts right before inserting a key that is a duplicate of a key in the
   // last sub-batch.
   size_t SubBatchCnt();
 
+  void MergeAcrossBatchAndDBImpl(ColumnFamilyHandle* column_family,
+                                 const Slice& key,
+                                 const PinnableWideColumns& existing,
+                                 const MergeContext& merge_context,
+                                 std::string* value,
+                                 PinnableWideColumns* columns, Status* status);
   void MergeAcrossBatchAndDB(ColumnFamilyHandle* column_family,
                              const Slice& key,
                              const PinnableWideColumns& existing,
                              const MergeContext& merge_context,
                              PinnableSlice* value, Status* status);
+  void MergeAcrossBatchAndDB(ColumnFamilyHandle* column_family,
+                             const Slice& key,
+                             const PinnableWideColumns& existing,
+                             const MergeContext& merge_context,
+                             PinnableWideColumns* columns, Status* status);
+
   Status GetFromBatchAndDB(DB* db, const ReadOptions& read_options,
                            ColumnFamilyHandle* column_family, const Slice& key,
                            PinnableSlice* value, ReadCallback* callback);
@@ -316,6 +405,17 @@ class WriteBatchWithIndex : public WriteBatchBase {
                               const size_t num_keys, const Slice* keys,
                               PinnableSlice* values, Status* statuses,
                               bool sorted_input, ReadCallback* callback);
+  Status GetEntityFromBatchAndDB(DB* db, const ReadOptions& read_options,
+                                 ColumnFamilyHandle* column_family,
+                                 const Slice& key, PinnableWideColumns* columns,
+                                 ReadCallback* callback);
+  void MultiGetEntityFromBatchAndDB(DB* db, const ReadOptions& read_options,
+                                    ColumnFamilyHandle* column_family,
+                                    size_t num_keys, const Slice* keys,
+                                    PinnableWideColumns* results,
+                                    Status* statuses, bool sorted_input,
+                                    ReadCallback* callback);
+
   struct Rep;
   std::unique_ptr<Rep> rep;
 };

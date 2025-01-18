@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "rocksdb/env_encryption.h"
 
 #include <algorithm>
@@ -117,7 +116,7 @@ IOStatus EncryptedRandomAccessFile::Prefetch(uint64_t offset, size_t n,
 
 size_t EncryptedRandomAccessFile::GetUniqueId(char* id, size_t max_size) const {
   return file_->GetUniqueId(id, max_size);
-};
+}
 
 void EncryptedRandomAccessFile::Hint(AccessPattern pattern) {
   file_->Hint(pattern);
@@ -1187,6 +1186,5 @@ Status EncryptionProvider::CreateFromString(
   RegisterEncryptionBuiltins();
   return LoadSharedObject<EncryptionProvider>(config_options, value, result);
 }
-
 
 }  // namespace ROCKSDB_NAMESPACE

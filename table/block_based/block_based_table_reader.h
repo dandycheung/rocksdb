@@ -16,6 +16,7 @@
 #include "cache/cache_key.h"
 #include "cache/cache_reservation_manager.h"
 #include "db/range_tombstone_fragmenter.h"
+#include "db/seqno_to_time_mapping.h"
 #include "file/filename.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/table_properties.h"
@@ -32,6 +33,7 @@
 #include "table/table_reader.h"
 #include "table/two_level_iterator.h"
 #include "trace_replay/block_cache_tracer.h"
+#include "util/atomic.h"
 #include "util/coro_utils.h"
 #include "util/hash_containers.h"
 
@@ -182,6 +184,8 @@ class BlockBasedTable : public TableReader {
   Status ApproximateKeyAnchors(const ReadOptions& read_options,
                                std::vector<Anchor>& anchors) override;
 
+  bool EraseFromCache(const BlockHandle& handle) const;
+
   bool TEST_BlockInCache(const BlockHandle& handle) const;
 
   // Returns true if the block for the specified key is in cache.
@@ -197,6 +201,8 @@ class BlockBasedTable : public TableReader {
 
   std::shared_ptr<const TableProperties> GetTableProperties() const override;
 
+  const SeqnoToTimeMapping& GetSeqnoToTimeMapping() const;
+
   size_t ApproximateMemoryUsage() const override;
 
   // convert SST file to a human readable form
@@ -204,6 +210,8 @@ class BlockBasedTable : public TableReader {
 
   Status VerifyChecksum(const ReadOptions& readOptions,
                         TableReaderCaller caller) override;
+
+  void MarkObsolete(uint32_t uncache_aggressiveness) override;
 
   ~BlockBasedTable();
 
@@ -238,6 +246,8 @@ class BlockBasedTable : public TableReader {
         FilePrefetchBuffer* /* tail_prefetch_buffer */) {
       return Status::OK();
     }
+    virtual void EraseFromCacheBeforeDestruction(
+        uint32_t /*uncache_aggressiveness*/) {}
   };
 
   class IndexReaderCommon;
@@ -459,14 +469,12 @@ class BlockBasedTable : public TableReader {
                            std::unique_ptr<IndexReader>* index_reader);
 
   bool FullFilterKeyMayMatch(FilterBlockReader* filter, const Slice& user_key,
-                             const bool no_io,
                              const SliceTransform* prefix_extractor,
                              GetContext* get_context,
                              BlockCacheLookupContext* lookup_context,
                              const ReadOptions& read_options) const;
 
   void FullFilterKeysMayMatch(FilterBlockReader* filter, MultiGetRange* range,
-                              const bool no_io,
                               const SliceTransform* prefix_extractor,
                               BlockCacheLookupContext* lookup_context,
                               const ReadOptions& read_options) const;
@@ -474,7 +482,8 @@ class BlockBasedTable : public TableReader {
   // If force_direct_prefetch is true, always prefetching to RocksDB
   //    buffer, rather than calling RandomAccessFile::Prefetch().
   static Status PrefetchTail(
-      const ReadOptions& ro, RandomAccessFileReader* file, uint64_t file_size,
+      const ReadOptions& ro, const ImmutableOptions& ioptions,
+      RandomAccessFileReader* file, uint64_t file_size,
       bool force_direct_prefetch, TailPrefetchStats* tail_prefetch_stats,
       const bool prefetch_all, const bool preload_all,
       std::unique_ptr<FilePrefetchBuffer>* prefetch_buffer, Statistics* stats,
@@ -492,6 +501,8 @@ class BlockBasedTable : public TableReader {
                            InternalIterator* meta_iter,
                            const InternalKeyComparator& internal_comparator,
                            BlockCacheLookupContext* lookup_context);
+  // If index and filter blocks do not need to be pinned, `prefetch_all`
+  // determines whether they will be read and add to cache.
   Status PrefetchIndexAndFilterBlocks(
       const ReadOptions& ro, FilePrefetchBuffer* prefetch_buffer,
       InternalIterator* meta_iter, BlockBasedTable* new_table,
@@ -607,6 +618,7 @@ struct BlockBasedTable::Rep {
   BlockHandle compression_dict_handle;
 
   std::shared_ptr<const TableProperties> table_properties;
+  SeqnoToTimeMapping seqno_to_time_mapping;
   BlockHandle index_handle;
   BlockBasedTableOptions::IndexType index_type;
   bool whole_key_filtering;
@@ -615,11 +627,7 @@ struct BlockBasedTable::Rep {
 
   std::shared_ptr<FragmentedRangeTombstoneList> fragmented_range_dels;
 
-  // FIXME
-  // If true, data blocks in this file are definitely ZSTD compressed. If false
-  // they might not be. When false we skip creating a ZSTD digested
-  // uncompression dictionary. Even if we get a false negative, things should
-  // still work, just not as quickly.
+  // Context for block cache CreateCallback
   BlockCreateContext create_context;
 
   // If global_seqno is used, all Keys in this file will have the same
@@ -667,6 +675,13 @@ struct BlockBasedTable::Rep {
   // partitioned filters), the `first_internal_key` in `IndexValue`, the
   // `end_key` for range deletion entries.
   const bool user_defined_timestamps_persisted;
+
+  // Set to >0 when the file is known to be obsolete and should have its block
+  // cache entries evicted on close. NOTE: when the file becomes obsolete,
+  // there could be multiple table cache references that all mark this file as
+  // obsolete. An atomic resolves the race quite reasonably. Even in the rare
+  // case of such a race, they will most likely be storing the same value.
+  RelaxedAtomic<uint32_t> uncache_aggressiveness{0};
 
   std::unique_ptr<CacheReservationManager::CacheReservationHandle>
       table_reader_cache_res_handle = nullptr;

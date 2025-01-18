@@ -30,7 +30,7 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <vector>
+#include <unordered_map>
 
 #include "rocksdb/status.h"
 #include "rocksdb/write_batch_base.h"
@@ -101,15 +101,12 @@ class WriteBatch : public WriteBatchBase {
   }
 
   using WriteBatchBase::TimedPut;
-  // DO NOT USE, UNDER CONSTRUCTION
+  // EXPERIMENTAL
   // Stores the mapping "key->value" in the database with the specified write
-  // time in the column family.
-  Status TimedPut(ColumnFamilyHandle* /* column_family */,
-                  const Slice& /* key */, const Slice& /* value */,
-                  uint64_t /* write_unix_time */) override {
-    // TODO(yuzhangyu): implement take in the write time.
-    return Status::NotSupported("TimedPut is under construction");
-  }
+  // time in the column family. Also see documentation in
+  // `WriteBatchBase::TimedPut` for the API's usage and limitations.
+  Status TimedPut(ColumnFamilyHandle* column_family, const Slice& key,
+                  const Slice& value, uint64_t write_unix_time) override;
 
   // Store the mapping "key->{column1:value1, column2:value2, ...}" in the
   // column family specified by "column_family".
@@ -212,6 +209,8 @@ class WriteBatch : public WriteBatchBase {
 
   using WriteBatchBase::Clear;
   // Clear all updates buffered in this batch.
+  // Internally, it calls resize() on the string buffer. So allocated memory
+  // capacity may not be freed.
   void Clear() override;
 
   // Records the state of the batch for future calls to RollbackToSavePoint().
@@ -258,6 +257,13 @@ class WriteBatch : public WriteBatchBase {
     }
     // If user-defined timestamp is enabled, then `key` includes timestamp.
     virtual void Put(const Slice& /*key*/, const Slice& /*value*/) {}
+
+    // If user-defined timestamp is enabled, then `key` includes timestamp.
+    virtual Status TimedPutCF(uint32_t /*column_family_id*/,
+                              const Slice& /*key*/, const Slice& /*value*/,
+                              uint64_t /*write_time*/) {
+      return Status::InvalidArgument("TimedPutCF not implemented");
+    }
 
     // If user-defined timestamp is enabled, then `key` includes timestamp.
     virtual Status PutEntityCF(uint32_t /* column_family_id */,
@@ -384,6 +390,9 @@ class WriteBatch : public WriteBatchBase {
   // Returns true if PutCF will be called during Iterate
   bool HasPut() const;
 
+  // Returns true if TimedPutCF will be called during Iterate
+  bool HasTimedPut() const;
+
   // Returns true if PutEntityCF will be called during Iterate
   bool HasPutEntity() const;
 
@@ -429,6 +438,30 @@ class WriteBatch : public WriteBatchBase {
   // size_t ts_sz_func(uint32_t cf);
   Status UpdateTimestamps(const Slice& ts,
                           std::function<size_t(uint32_t /*cf*/)> ts_sz_func);
+
+  // TODO: remove these internal APIs after MyRocks refactor to not directly
+  // write to a `WriteBatch` retrieved from `Transaction` via
+  // `Transaction::GetWriteBatch`.
+
+  void SetTrackTimestampSize(bool track_timestamp_size) {
+    track_timestamp_size_ = track_timestamp_size;
+  }
+
+  inline void MaybeTrackTimestampSize(uint32_t column_family_id, size_t ts_sz) {
+    if (!track_timestamp_size_) {
+      return;
+    }
+    auto iter = cf_id_to_ts_sz_.find(column_family_id);
+    if (iter == cf_id_to_ts_sz_.end()) {
+      cf_id_to_ts_sz_.emplace(column_family_id, ts_sz);
+    }
+  }
+
+  // Return a mapping from column family id to timestamp size of all the column
+  // families involved in this WriteBatch.
+  const std::unordered_map<uint32_t, size_t>& GetColumnFamilyToTimestampSize() {
+    return cf_id_to_ts_sz_;
+  }
 
   // Verify the per-key-value checksums of this write batch.
   // Corruption status will be returned if the verification fails.
@@ -503,6 +536,10 @@ class WriteBatch : public WriteBatchBase {
   std::unique_ptr<ProtectionInfo> prot_info_;
 
   size_t default_cf_ts_sz_ = 0;
+
+  bool track_timestamp_size_ = false;
+
+  std::unordered_map<uint32_t, size_t> cf_id_to_ts_sz_;
 
  protected:
   std::string rep_;  // See comment in write_batch.cc for the format of rep_

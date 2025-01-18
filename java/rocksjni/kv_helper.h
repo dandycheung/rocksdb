@@ -83,7 +83,7 @@ class KVException : public std::exception {
 
   KVException(jint code) : kCode_(code){};
 
-  virtual const char* what() const throw() {
+  virtual const char* what() const noexcept {
     return "Exception raised by JNI. There may be a Java exception in the "
            "JNIEnv. Please check!";
   }
@@ -213,13 +213,10 @@ class JByteArrayPinnableSlice {
    */
   jbyteArray NewByteArray() {
     const jint pinnable_len = static_cast<jint>(pinnable_slice_.size());
-    jbyteArray jbuffer = env_->NewByteArray(static_cast<jsize>(pinnable_len));
+    jbyteArray jbuffer =
+        ROCKSDB_NAMESPACE::JniUtil::createJavaByteArrayWithSizeCheck(
+            env_, pinnable_slice_.data(), pinnable_len);
     KVException::ThrowOnError(env_);  // OutOfMemoryError
-
-    env_->SetByteArrayRegion(
-        jbuffer, 0, pinnable_len,
-        reinterpret_cast<const jbyte*>(pinnable_slice_.data()));
-    KVException::ThrowOnError(env_);  // ArrayIndexOutOfBoundsException
 
     return jbuffer;
   }

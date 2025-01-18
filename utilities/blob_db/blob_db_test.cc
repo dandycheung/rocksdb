@@ -3,7 +3,6 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-
 #include "utilities/blob_db/blob_db.h"
 
 #include <algorithm>
@@ -31,8 +30,7 @@
 #include "utilities/blob_db/blob_db_impl.h"
 #include "utilities/fault_injection_env.h"
 
-namespace ROCKSDB_NAMESPACE {
-namespace blob_db {
+namespace ROCKSDB_NAMESPACE::blob_db {
 
 class BlobDBTest : public testing::Test {
  public:
@@ -118,9 +116,7 @@ class BlobDBTest : public testing::Test {
     }
   }
 
-  BlobDBImpl *blob_db_impl() {
-    return reinterpret_cast<BlobDBImpl *>(blob_db_);
-  }
+  BlobDBImpl *blob_db_impl() { return static_cast<BlobDBImpl *>(blob_db_); }
 
   Status Put(const Slice &key, const Slice &value,
              std::map<std::string, std::string> *data = nullptr) {
@@ -609,7 +605,7 @@ TEST_F(BlobDBTest, EnableDisableCompressionGC) {
   VerifyDB(data);
 
   blob_files = blob_db_impl()->TEST_GetBlobFiles();
-  for (auto bfile : blob_files) {
+  for (const auto &bfile : blob_files) {
     ASSERT_EQ(kNoCompression, bfile->GetCompressionType());
   }
 
@@ -629,7 +625,7 @@ TEST_F(BlobDBTest, EnableDisableCompressionGC) {
   VerifyDB(data);
 
   blob_files = blob_db_impl()->TEST_GetBlobFiles();
-  for (auto bfile : blob_files) {
+  for (const auto &bfile : blob_files) {
     ASSERT_EQ(kSnappyCompression, bfile->GetCompressionType());
   }
 }
@@ -680,7 +676,7 @@ TEST_F(BlobDBTest, ChangeCompressionGC) {
 
   blob_db_impl()->TEST_DeleteObsoleteFiles();
   blob_files = blob_db_impl()->TEST_GetBlobFiles();
-  for (auto bfile : blob_files) {
+  for (const auto &bfile : blob_files) {
     ASSERT_EQ(kSnappyCompression, bfile->GetCompressionType());
   }
 
@@ -697,7 +693,7 @@ TEST_F(BlobDBTest, ChangeCompressionGC) {
 
   blob_db_impl()->TEST_DeleteObsoleteFiles();
   blob_files = blob_db_impl()->TEST_GetBlobFiles();
-  for (auto bfile : blob_files) {
+  for (const auto &bfile : blob_files) {
     ASSERT_EQ(kNoCompression, bfile->GetCompressionType());
   }
 
@@ -721,7 +717,7 @@ TEST_F(BlobDBTest, ChangeCompressionGC) {
 
   blob_db_impl()->TEST_DeleteObsoleteFiles();
   blob_files = blob_db_impl()->TEST_GetBlobFiles();
-  for (auto bfile : blob_files) {
+  for (const auto &bfile : blob_files) {
     ASSERT_EQ(kLZ4Compression, bfile->GetCompressionType());
   }
 }
@@ -733,8 +729,8 @@ TEST_F(BlobDBTest, MultipleWriters) {
 
   std::vector<port::Thread> workers;
   std::vector<std::map<std::string, std::string>> data_set(10);
-  for (uint32_t i = 0; i < 10; i++)
-    workers.push_back(port::Thread(
+  for (uint32_t i = 0; i < 10; i++) {
+    workers.emplace_back(
         [&](uint32_t id) {
           Random rnd(301 + id);
           for (int j = 0; j < 100; j++) {
@@ -749,7 +745,8 @@ TEST_F(BlobDBTest, MultipleWriters) {
             }
           }
         },
-        i));
+        i);
+  }
   std::map<std::string, std::string> data;
   for (size_t i = 0; i < 10; i++) {
     workers[i].join();
@@ -762,7 +759,7 @@ TEST_F(BlobDBTest, SstFileManager) {
   // run the same test for Get(), MultiGet() and Iterator each.
   std::shared_ptr<SstFileManager> sst_file_manager(
       NewSstFileManager(mock_env_.get()));
-  sst_file_manager->SetDeleteRateBytesPerSecond(1);
+  sst_file_manager->SetDeleteRateBytesPerSecond(1024 * 1024);
   SstFileManagerImpl *sfm =
       static_cast<SstFileManagerImpl *>(sst_file_manager.get());
 
@@ -820,7 +817,7 @@ TEST_F(BlobDBTest, SstFileManagerRestart) {
   // run the same test for Get(), MultiGet() and Iterator each.
   std::shared_ptr<SstFileManager> sst_file_manager(
       NewSstFileManager(mock_env_.get()));
-  sst_file_manager->SetDeleteRateBytesPerSecond(1);
+  sst_file_manager->SetDeleteRateBytesPerSecond(1024 * 1024);
   SstFileManagerImpl *sfm =
       static_cast<SstFileManagerImpl *>(sst_file_manager.get());
 
@@ -1015,6 +1012,27 @@ TEST_F(BlobDBTest, GetLiveFilesMetaData) {
   ASSERT_EQ(5U, livefile.size());
   ASSERT_EQ(filename1, livefile[3]);
   ASSERT_EQ(filename2, livefile[4]);
+
+  std::vector<LiveFileStorageInfo> all_files, blob_files;
+  ASSERT_OK(blob_db_->GetLiveFilesStorageInfo(LiveFilesStorageInfoOptions(),
+                                              &all_files));
+  for (size_t i = 0; i < all_files.size(); i++) {
+    if (all_files[i].file_type == kBlobFile) {
+      blob_files.push_back(all_files[i]);
+    }
+  }
+
+  ASSERT_EQ(2U, blob_files.size());
+  ASSERT_GT(all_files.size(), blob_files.size());
+
+  ASSERT_EQ("000001.blob", blob_files[0].relative_filename);
+  ASSERT_EQ(blob_db_impl()->TEST_blob_dir(), blob_files[0].directory);
+  ASSERT_GT(blob_files[0].size, 0);
+
+  ASSERT_EQ("000002.blob", blob_files[1].relative_filename);
+  ASSERT_EQ(blob_db_impl()->TEST_blob_dir(), blob_files[1].directory);
+  ASSERT_GT(blob_files[1].size, 0);
+
   VerifyDB(data);
 }
 
@@ -1377,8 +1395,8 @@ TEST_F(BlobDBTest, UserCompactionFilter) {
   constexpr uint64_t kMinValueSize = 1 << 6;
   constexpr uint64_t kMaxValueSize = 1 << 8;
   constexpr uint64_t kMinBlobSize = 1 << 7;
-  static_assert(kMinValueSize < kMinBlobSize, "");
-  static_assert(kMaxValueSize > kMinBlobSize, "");
+  static_assert(kMinValueSize < kMinBlobSize);
+  static_assert(kMaxValueSize > kMinBlobSize);
 
   BlobDBOptions bdb_options;
   bdb_options.min_blob_size = kMinBlobSize;
@@ -1749,8 +1767,8 @@ TEST_F(BlobDBTest, GarbageCollection) {
   constexpr uint64_t kSmallValueSize = 1 << 6;
   constexpr uint64_t kLargeValueSize = 1 << 8;
   constexpr uint64_t kMinBlobSize = 1 << 7;
-  static_assert(kSmallValueSize < kMinBlobSize, "");
-  static_assert(kLargeValueSize > kMinBlobSize, "");
+  static_assert(kSmallValueSize < kMinBlobSize);
+  static_assert(kLargeValueSize > kMinBlobSize);
 
   constexpr size_t kBlobsPerFile = 8;
   constexpr size_t kNumBlobFiles = kNumPuts / kBlobsPerFile;
@@ -2001,7 +2019,7 @@ TEST_F(BlobDBTest, EvictExpiredFile) {
   ASSERT_EQ(0, blob_db_impl()->TEST_GetObsoleteFiles().size());
   // Make sure we don't return garbage value after blob file being evicted,
   // but the blob index still exists in the LSM tree.
-  std::string val = "";
+  std::string val;
   ASSERT_TRUE(blob_db_->Get(ReadOptions(), "foo", &val).IsNotFound());
   ASSERT_EQ("", val);
 }
@@ -2011,40 +2029,36 @@ TEST_F(BlobDBTest, DisableFileDeletions) {
   bdb_options.disable_background_tasks = true;
   Open(bdb_options);
   std::map<std::string, std::string> data;
-  for (bool force : {true, false}) {
-    ASSERT_OK(Put("foo", "v", &data));
-    auto blob_files = blob_db_impl()->TEST_GetBlobFiles();
-    ASSERT_EQ(1, blob_files.size());
-    auto blob_file = blob_files[0];
-    ASSERT_OK(blob_db_impl()->TEST_CloseBlobFile(blob_file));
-    blob_db_impl()->TEST_ObsoleteBlobFile(blob_file);
-    ASSERT_EQ(1, blob_db_impl()->TEST_GetBlobFiles().size());
-    ASSERT_EQ(1, blob_db_impl()->TEST_GetObsoleteFiles().size());
-    // Call DisableFileDeletions twice.
-    ASSERT_OK(blob_db_->DisableFileDeletions());
-    ASSERT_OK(blob_db_->DisableFileDeletions());
-    // File deletions should be disabled.
-    blob_db_impl()->TEST_DeleteObsoleteFiles();
-    ASSERT_EQ(1, blob_db_impl()->TEST_GetBlobFiles().size());
-    ASSERT_EQ(1, blob_db_impl()->TEST_GetObsoleteFiles().size());
-    VerifyDB(data);
-    // Enable file deletions once. If force=true, file deletion is enabled.
-    // Otherwise it needs to enable it for a second time.
-    ASSERT_OK(blob_db_->EnableFileDeletions(force));
-    blob_db_impl()->TEST_DeleteObsoleteFiles();
-    if (!force) {
-      ASSERT_EQ(1, blob_db_impl()->TEST_GetBlobFiles().size());
-      ASSERT_EQ(1, blob_db_impl()->TEST_GetObsoleteFiles().size());
-      VerifyDB(data);
-      // Call EnableFileDeletions a second time.
-      ASSERT_OK(blob_db_->EnableFileDeletions(/*force=*/false));
-      blob_db_impl()->TEST_DeleteObsoleteFiles();
-    }
-    // Regardless of value of `force`, file should be deleted by now.
-    ASSERT_EQ(0, blob_db_impl()->TEST_GetBlobFiles().size());
-    ASSERT_EQ(0, blob_db_impl()->TEST_GetObsoleteFiles().size());
-    VerifyDB({});
-  }
+  ASSERT_OK(Put("foo", "v", &data));
+  auto blob_files = blob_db_impl()->TEST_GetBlobFiles();
+  ASSERT_EQ(1, blob_files.size());
+  auto blob_file = blob_files[0];
+  ASSERT_OK(blob_db_impl()->TEST_CloseBlobFile(blob_file));
+  blob_db_impl()->TEST_ObsoleteBlobFile(blob_file);
+  ASSERT_EQ(1, blob_db_impl()->TEST_GetBlobFiles().size());
+  ASSERT_EQ(1, blob_db_impl()->TEST_GetObsoleteFiles().size());
+  // Call DisableFileDeletions twice.
+  ASSERT_OK(blob_db_->DisableFileDeletions());
+  ASSERT_OK(blob_db_->DisableFileDeletions());
+  // File deletions should be disabled.
+  blob_db_impl()->TEST_DeleteObsoleteFiles();
+  ASSERT_EQ(1, blob_db_impl()->TEST_GetBlobFiles().size());
+  ASSERT_EQ(1, blob_db_impl()->TEST_GetObsoleteFiles().size());
+  VerifyDB(data);
+  // Enable file deletions once. File deletion will later get enabled when
+  // `EnableFileDeletions` called for a second time.
+  ASSERT_OK(blob_db_->EnableFileDeletions());
+  blob_db_impl()->TEST_DeleteObsoleteFiles();
+  ASSERT_EQ(1, blob_db_impl()->TEST_GetBlobFiles().size());
+  ASSERT_EQ(1, blob_db_impl()->TEST_GetObsoleteFiles().size());
+  VerifyDB(data);
+  // Call EnableFileDeletions a second time.
+  ASSERT_OK(blob_db_->EnableFileDeletions());
+  blob_db_impl()->TEST_DeleteObsoleteFiles();
+  // File should be deleted by now.
+  ASSERT_EQ(0, blob_db_impl()->TEST_GetBlobFiles().size());
+  ASSERT_EQ(0, blob_db_impl()->TEST_GetObsoleteFiles().size());
+  VerifyDB({});
 }
 
 TEST_F(BlobDBTest, MaintainBlobFileToSstMapping) {
@@ -2419,8 +2433,7 @@ TEST_F(BlobDBTest, SyncBlobFileBeforeCloseIOError) {
   ASSERT_TRUE(s.IsIOError());
 }
 
-}  //  namespace blob_db
-}  // namespace ROCKSDB_NAMESPACE
+}  // namespace ROCKSDB_NAMESPACE::blob_db
 
 // A black-box test for the ttl wrapper around rocksdb
 int main(int argc, char **argv) {

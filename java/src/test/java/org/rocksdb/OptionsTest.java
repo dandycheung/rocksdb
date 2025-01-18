@@ -699,31 +699,12 @@ public class OptionsTest {
     }
   }
 
-  @SuppressWarnings("deprecated")
-  @Test
-  public void accessHintOnCompactionStart() {
-    try (final Options opt = new Options()) {
-      final AccessHint accessHint = AccessHint.SEQUENTIAL;
-      opt.setAccessHintOnCompactionStart(accessHint);
-      assertThat(opt.accessHintOnCompactionStart()).isEqualTo(accessHint);
-    }
-  }
-
   @Test
   public void compactionReadaheadSize() {
     try (final Options opt = new Options()) {
       final long longValue = rand.nextLong();
       opt.setCompactionReadaheadSize(longValue);
       assertThat(opt.compactionReadaheadSize()).isEqualTo(longValue);
-    }
-  }
-
-  @Test
-  public void randomAccessMaxBufferSize() {
-    try (final Options opt = new Options()) {
-      final long longValue = rand.nextLong();
-      opt.setRandomAccessMaxBufferSize(longValue);
-      assertThat(opt.randomAccessMaxBufferSize()).isEqualTo(longValue);
     }
   }
 
@@ -1389,9 +1370,9 @@ public class OptionsTest {
   @Test
   public void writeDbidToManifest() {
     try (final Options options = new Options()) {
-      assertThat(options.writeDbidToManifest()).isEqualTo(false);
-      assertThat(options.setWriteDbidToManifest(true)).isEqualTo(options);
       assertThat(options.writeDbidToManifest()).isEqualTo(true);
+      assertThat(options.setWriteDbidToManifest(false)).isEqualTo(options);
+      assertThat(options.writeDbidToManifest()).isEqualTo(false);
     }
   }
 
@@ -1460,6 +1441,16 @@ public class OptionsTest {
       final int val = 32;
       assertThat(options.setMemtableMaxRangeDeletions(val)).isEqualTo(options);
       assertThat(options.memtableMaxRangeDeletions()).isEqualTo(val);
+    }
+  }
+
+  @Test
+  public void dailyOffpeakTimeUTC() {
+    try (final Options options = new Options()) {
+      assertThat(options.dailyOffpeakTimeUTC()).isEqualTo("");
+      final String offPeak = "03:45-20:15";
+      assertThat(options.setDailyOffpeakTimeUTC(offPeak)).isEqualTo(options);
+      assertThat(options.dailyOffpeakTimeUTC()).isEqualTo(offPeak);
     }
   }
 

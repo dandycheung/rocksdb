@@ -7,6 +7,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include "rocksdb/cache.h"
+#include "rocksdb/options.h"
+#include "rocksdb/utilities/backup_engine.h"
 #ifdef GFLAGS
 #include "db_stress_tool/db_stress_common.h"
 
@@ -32,6 +35,11 @@ DEFINE_int64(max_key, 1 * KB * KB,
              "Max number of key/values to place in database");
 
 DEFINE_int32(max_key_len, 3, "Maximum length of a key in 8-byte units");
+
+DEFINE_uint64(max_sequential_skip_in_iterations,
+              ROCKSDB_NAMESPACE::Options().max_sequential_skip_in_iterations,
+              "Iterator will reseek after scanning this number of keys with"
+              "the same user key during Next/Prev().");
 
 DEFINE_string(key_len_percent_dist, "",
               "Percentages of keys of various lengths. For example, 1,30,69 "
@@ -298,14 +306,25 @@ DEFINE_int32(universal_max_merge_width, 0,
 DEFINE_int32(universal_max_size_amplification_percent, 0,
              "The max size amplification for universal style compaction");
 
+DEFINE_int32(universal_max_read_amp, -1,
+             "The limit on the number of sorted runs");
+
 DEFINE_int32(clear_column_family_one_in, 1000000,
              "With a chance of 1/N, delete a column family and then recreate "
              "it again. If N == 0, never drop/create column families. "
              "When test_batches_snapshots is true, this flag has no effect");
 
-DEFINE_int32(get_live_files_one_in, 1000000,
-             "With a chance of 1/N, call GetLiveFiles to verify if it returns "
-             "correctly. If N == 0, do not call the interface.");
+DEFINE_int32(
+    get_live_files_apis_one_in, 1000000,
+    "With a chance of 1/N, call GetLiveFiles(), GetLiveFilesMetaData() and "
+    "GetLiveFilesChecksumInfo() to verify if it returns "
+    "OK or violate any internal assertion. If N == 0, do not call the "
+    "interface.");
+
+DEFINE_int32(
+    get_all_column_family_metadata_one_in, 1000000,
+    "With a chance of 1/N, call GetAllColumnFamilyMetaData to verify if it "
+    "violates any internal assertion. If N == 0, do not call the interface.");
 
 DEFINE_int32(
     get_sorted_wal_files_one_in, 1000000,
@@ -361,6 +380,11 @@ DEFINE_bool(charge_blob_cache, false,
             "CacheEntryRoleOptions::charged of "
             "kBlobCache");
 
+DEFINE_bool(
+    decouple_partitioned_filters,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions().decouple_partitioned_filters,
+    "Decouple filter partitioning from index partitioning.");
+
 DEFINE_int32(
     top_level_index_pinning,
     static_cast<int32_t>(ROCKSDB_NAMESPACE::PinningTier::kFallback),
@@ -387,6 +411,8 @@ DEFINE_uint64(subcompactions, 1,
 
 DEFINE_uint64(periodic_compaction_seconds, 1000,
               "Files older than this value will be picked up for compaction.");
+DEFINE_string(daily_offpeak_time_utc, "",
+              "If set, process periodic compactions during this period only");
 
 DEFINE_uint64(compaction_ttl, 1000,
               "Files older than TTL will be compacted to the next level.");
@@ -402,7 +428,8 @@ DEFINE_double(experimental_mempurge_threshold, 0.0,
               "Maximum estimated useful payload that triggers a "
               "mempurge process to collect memtable garbage bytes.");
 
-DEFINE_bool(enable_write_thread_adaptive_yield, true,
+DEFINE_bool(enable_write_thread_adaptive_yield,
+            ROCKSDB_NAMESPACE::Options().enable_write_thread_adaptive_yield,
             "Use a yielding spin loop for brief writer thread waits.");
 
 // Options for StackableDB-based BlobDB
@@ -470,7 +497,7 @@ DEFINE_double(blob_garbage_collection_force_threshold,
               ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
                   .blob_garbage_collection_force_threshold,
               "[Integrated BlobDB] The threshold for the ratio of garbage in "
-              "the oldest blob files for forcing garbage collection.");
+              "the eligible blob files for forcing garbage collection.");
 
 DEFINE_uint64(blob_compaction_readahead_size,
               ROCKSDB_NAMESPACE::AdvancedColumnFamilyOptions()
@@ -507,8 +534,6 @@ DEFINE_int32(prepopulate_blob_cache, 0,
              "[Integrated BlobDB] Pre-populate hot/warm blobs in blob cache. 0 "
              "to disable and 1 to insert during flush.");
 
-DEFINE_bool(enable_tiered_storage, false, "Set last_level_temperature");
-
 DEFINE_int64(preclude_last_level_data_seconds, 0,
              "Preclude data from the last level. Used with tiered storage "
              "feature to preclude new data from comacting to the last level.");
@@ -516,6 +541,14 @@ DEFINE_int64(preclude_last_level_data_seconds, 0,
 DEFINE_int64(
     preserve_internal_time_seconds, 0,
     "Preserve internal time information which is attached to each SST.");
+
+DEFINE_uint32(use_timed_put_one_in, 0,
+              "If greater than zero, TimedPut is used per every N write ops on "
+              "on average.");
+
+DEFINE_string(file_temperature_age_thresholds, "",
+              "See CompactionOptionsFIFO::file_temperature_age_thresholds. "
+              "empty == unset");
 
 static const bool FLAGS_subcompactions_dummy __attribute__((__unused__)) =
     RegisterFlagValidator(&FLAGS_subcompactions, &ValidateUint32Range);
@@ -557,6 +590,16 @@ DEFINE_bool(
     ROCKSDB_NAMESPACE::BlockBasedTableOptions()
         .detect_filter_construct_corruption,
     "Detect corruption during new Bloom Filter and Ribbon Filter construction");
+
+DEFINE_string(sqfc_name, "foo",
+              "Config name to select from SstQueryFilterConfigsManager.");
+
+DEFINE_uint32(sqfc_version, 0,
+              "User-defined filtering version to select from "
+              "SstQueryFilterConfigsManager. 0 = disable writing filters");
+
+DEFINE_bool(use_sqfc_for_range_queries, true,
+            "Apply SstQueryFilters to range queries");
 
 DEFINE_int32(
     index_type,
@@ -735,6 +778,10 @@ DEFINE_int32(compact_range_one_in, 0,
              "If non-zero, then CompactRange() will be called once for every N "
              "operations on average.  0 indicates CompactRange() is disabled.");
 
+DEFINE_int32(promote_l0_one_in, 0,
+             "If non-zero, then PromoteL0() will be called once for every N "
+             "operations on average.  0 indicates PromoteL0() is disabled.");
+
 DEFINE_int32(mark_for_compaction_one_file_in, 0,
              "A `TablePropertiesCollectorFactory` will be registered, which "
              "creates a `TablePropertiesCollector` with `NeedCompact()` "
@@ -745,9 +792,26 @@ DEFINE_int32(flush_one_in, 0,
              "If non-zero, then Flush() will be called once for every N ops "
              "on average.  0 indicates calls to Flush() are disabled.");
 
+DEFINE_int32(key_may_exist_one_in, 0,
+             "If non-zero, then KeyMayExist() will be called "
+             "once for every N ops on average.  0 disables.");
+
+DEFINE_int32(reset_stats_one_in, 0,
+             "If non-zero, then ResetStats() will be called "
+             "once for every N ops on average.  0 disables.");
+
 DEFINE_int32(pause_background_one_in, 0,
              "If non-zero, then PauseBackgroundWork()+Continue will be called "
              "once for every N ops on average.  0 disables.");
+
+DEFINE_int32(disable_file_deletions_one_in, 0,
+             "If non-zero, then DisableFileDeletions()+Enable will be called "
+             "once for every N ops on average.  0 disables.");
+
+DEFINE_int32(
+    disable_manual_compaction_one_in, 0,
+    "If non-zero, then DisableManualCompaction()+Enable will be called "
+    "once for every N ops on average.  0 disables.");
 
 DEFINE_int32(compact_range_width, 10000,
              "The width of the ranges passed to CompactRange().");
@@ -774,6 +838,18 @@ DEFINE_bool(use_get_entity, false, "If set, use the GetEntity API for reads");
 
 DEFINE_bool(use_multi_get_entity, false,
             "If set, use the MultiGetEntity API for reads");
+
+DEFINE_int32(test_ingest_standalone_range_deletion_one_in, 0,
+             "If non-zero, file ingestion flow will test standalone range "
+             "deletion file once every N file ingestion operations.");
+
+DEFINE_bool(allow_unprepared_value,
+            ROCKSDB_NAMESPACE::ReadOptions().allow_unprepared_value,
+            "Allow lazy loading of values for range scans");
+
+DEFINE_bool(track_and_verify_wals,
+            ROCKSDB_NAMESPACE::Options().track_and_verify_wals,
+            "See Options::track_and_verify_wals");
 
 static bool ValidateInt32Percent(const char* flagname, int32_t value) {
   if (value < 0 || value > 100) {
@@ -910,6 +986,12 @@ DEFINE_uint32(use_put_entity_one_in, 0,
               "If greater than zero, PutEntity will be used once per every N "
               "write ops on average.");
 
+DEFINE_bool(use_attribute_group, false,
+            "If set, use the attribute_group API to put/get entities");
+
+DEFINE_bool(use_multi_cf_iterator, false,
+            "If set, use the multi_cf_iterator for TestIterate");
+
 DEFINE_bool(use_full_merge_v1, false,
             "On true, use a merge operator that implement the deprecated "
             "version of FullMerge");
@@ -926,6 +1008,10 @@ DEFINE_bool(avoid_unnecessary_blocking_io,
 DEFINE_bool(write_dbid_to_manifest,
             ROCKSDB_NAMESPACE::Options().write_dbid_to_manifest,
             "Write DB_ID to manifest");
+
+DEFINE_bool(write_identity_file,
+            ROCKSDB_NAMESPACE::Options().write_identity_file,
+            "Write DB_ID to IDENTITY file");
 
 DEFINE_bool(avoid_flush_during_recovery,
             ROCKSDB_NAMESPACE::Options().avoid_flush_during_recovery,
@@ -961,16 +1047,30 @@ DEFINE_int32(continuous_verification_interval, 1000,
              "disables continuous verification.");
 
 DEFINE_int32(approximate_size_one_in, 64,
-             "If non-zero, DB::GetApproximateSizes() will be called against"
-             " random key ranges.");
+             "If non-zero, DB::GetApproximateSizes() and "
+             "DB::GetApproximateMemTableStats() will be called against "
+             "random key ranges.");
 
 DEFINE_int32(read_fault_one_in, 1000,
              "On non-zero, enables fault injection on read");
+
+DEFINE_bool(error_recovery_with_no_fault_injection, false,
+            "If true, error recovery will be done without fault injection if "
+            "fault injection is enabled");
+
+DEFINE_int32(metadata_read_fault_one_in, 1000,
+             "On non-zero, enables fault injection on metadata read (i.e, "
+             "directory and file metadata read)");
 
 DEFINE_int32(get_property_one_in, 1000,
              "If non-zero, then DB::GetProperty() will be called to get various"
              " properties for every N ops on average. 0 indicates that"
              " GetProperty() will be not be called.");
+
+DEFINE_int32(get_properties_of_all_tables_one_in, 1000,
+             "If non-zero, then DB::GetPropertiesOfAllTables() will be called "
+             "for every N ops on average. 0 indicates that"
+             " it will be not be called.");
 
 DEFINE_bool(sync_fault_injection, false,
             "If true, FaultInjectionTestFS will be used for write operations, "
@@ -1021,6 +1121,13 @@ DEFINE_int32(write_fault_one_in, 0,
              "On non-zero, enables fault injection on write. Currently only"
              "injects write error when writing to SST files.");
 
+DEFINE_bool(exclude_wal_from_write_fault_injection, false,
+            "If true, we won't inject write fault when writing to WAL file");
+
+DEFINE_int32(metadata_write_fault_one_in, 1000,
+             "On non-zero, enables fault injection on metadata write (i.e, "
+             "directory and file metadata write)");
+
 DEFINE_uint64(user_timestamp_size, 0,
               "Number of bytes for a user-defined timestamp. Currently, only "
               "8-byte is supported");
@@ -1028,6 +1135,11 @@ DEFINE_uint64(user_timestamp_size, 0,
 DEFINE_bool(persist_user_defined_timestamps, true,
             "Flag to indicate whether user-defined timestamps will be persisted"
             " during Flush");
+
+DEFINE_int32(open_metadata_read_fault_one_in, 0,
+             "On non-zero, enables fault injection on file metadata read (i.e, "
+             "directory and file metadata read)"
+             "during DB reopen.");
 
 DEFINE_int32(open_metadata_write_fault_one_in, 0,
              "On non-zero, enables fault injection on file metadata write "
@@ -1129,11 +1241,9 @@ DEFINE_uint64(stats_dump_period_sec,
               ROCKSDB_NAMESPACE::Options().stats_dump_period_sec,
               "Gap between printing stats to log in seconds");
 
-DEFINE_bool(use_io_uring, false, "Enable the use of IO uring on Posix");
-
 DEFINE_bool(verification_only, false,
             "If true, tests will only execute verification step");
-extern "C" bool RocksDbIOUringEnable() { return FLAGS_use_io_uring; }
+extern "C" bool RocksDbIOUringEnable() { return true; }
 
 DEFINE_uint32(memtable_max_range_deletions, 0,
               "If nonzero, RocksDB will try to flush the current memtable"
@@ -1146,4 +1256,224 @@ DEFINE_uint32(bottommost_file_compaction_delay, 0,
 DEFINE_bool(auto_readahead_size, false,
             "Does auto tuning of readahead_size when enabled during scans.");
 
+DEFINE_bool(allow_fallocate, ROCKSDB_NAMESPACE::Options().allow_fallocate,
+            "Options.allow_fallocate");
+
+DEFINE_int32(table_cache_numshardbits,
+             ROCKSDB_NAMESPACE::Options().table_cache_numshardbits,
+             "Options.table_cache_numshardbits");
+
+DEFINE_uint64(log_readahead_size,
+              ROCKSDB_NAMESPACE::Options().log_readahead_size,
+              "Options.log_readahead_size");
+
+DEFINE_uint64(bgerror_resume_retry_interval,
+              ROCKSDB_NAMESPACE::Options().bgerror_resume_retry_interval,
+              "Options.bgerror_resume_retry_interval");
+
+DEFINE_uint64(delete_obsolete_files_period_micros,
+              ROCKSDB_NAMESPACE::Options().delete_obsolete_files_period_micros,
+              "Options.delete_obsolete_files_period_micros");
+
+DEFINE_uint64(max_log_file_size, ROCKSDB_NAMESPACE::Options().max_log_file_size,
+              "Options.max_log_file_sizes");
+
+DEFINE_uint64(log_file_time_to_roll,
+              ROCKSDB_NAMESPACE::Options().log_file_time_to_roll,
+              "Options.log_file_time_to_roll");
+
+DEFINE_bool(use_adaptive_mutex, ROCKSDB_NAMESPACE::Options().use_adaptive_mutex,
+            "Options.use_adaptive_mutex");
+
+DEFINE_bool(advise_random_on_open,
+            ROCKSDB_NAMESPACE::Options().advise_random_on_open,
+            "Options.advise_random_on_open");
+
+DEFINE_uint64(WAL_ttl_seconds, ROCKSDB_NAMESPACE::Options().WAL_ttl_seconds,
+              "Options.WAL_ttl_seconds");
+
+DEFINE_uint64(WAL_size_limit_MB, ROCKSDB_NAMESPACE::Options().WAL_size_limit_MB,
+              "Options.WAL_size_limit_MB");
+
+DEFINE_bool(strict_bytes_per_sync,
+            ROCKSDB_NAMESPACE::Options().strict_bytes_per_sync,
+            "Options.strict_bytes_per_sync");
+
+DEFINE_bool(avoid_flush_during_shutdown,
+            ROCKSDB_NAMESPACE::Options().avoid_flush_during_shutdown,
+            "Options.avoid_flush_during_shutdown");
+
+DEFINE_bool(fill_cache, ROCKSDB_NAMESPACE::ReadOptions().fill_cache,
+            "ReadOptions.fill_cache");
+
+DEFINE_bool(optimize_multiget_for_io,
+            ROCKSDB_NAMESPACE::ReadOptions().optimize_multiget_for_io,
+            "ReadOptions.optimize_multiget_for_io");
+
+DEFINE_bool(memtable_insert_hint_per_batch,
+            ROCKSDB_NAMESPACE::WriteOptions().memtable_insert_hint_per_batch,
+            "WriteOptions.memtable_insert_hint_per_batch");
+
+DEFINE_bool(dump_malloc_stats, ROCKSDB_NAMESPACE::Options().dump_malloc_stats,
+            "Options.dump_malloc_stats");
+
+DEFINE_uint64(stats_history_buffer_size,
+              ROCKSDB_NAMESPACE::Options().stats_history_buffer_size,
+              "Options.stats_history_buffer_size");
+
+DEFINE_bool(skip_stats_update_on_db_open,
+            ROCKSDB_NAMESPACE::Options().skip_stats_update_on_db_open,
+            "Options.skip_stats_update_on_db_open");
+
+DEFINE_bool(optimize_filters_for_hits,
+            ROCKSDB_NAMESPACE::Options().optimize_filters_for_hits,
+            "Options.optimize_filters_for_hits");
+
+DEFINE_uint64(sample_for_compression,
+              ROCKSDB_NAMESPACE::Options().sample_for_compression,
+              "Options.sample_for_compression");
+
+DEFINE_bool(report_bg_io_stats, ROCKSDB_NAMESPACE::Options().report_bg_io_stats,
+            "Options.report_bg_io_stats");
+
+DEFINE_bool(
+    cache_index_and_filter_blocks_with_high_priority,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions()
+        .cache_index_and_filter_blocks_with_high_priority,
+    "BlockBasedTableOptions.cache_index_and_filter_blocks_with_high_priority");
+
+DEFINE_bool(use_delta_encoding,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions().use_delta_encoding,
+            "BlockBasedTableOptions.use_delta_encoding");
+
+DEFINE_bool(verify_compression,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions().verify_compression,
+            "BlockBasedTableOptions.verify_compression");
+
+DEFINE_uint32(
+    read_amp_bytes_per_bit,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions().read_amp_bytes_per_bit,
+    "Options.read_amp_bytes_per_bit");
+
+DEFINE_bool(
+    enable_index_compression,
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions().enable_index_compression,
+    "BlockBasedTableOptions.enable_index_compression");
+
+DEFINE_uint32(index_shortening,
+              static_cast<uint32_t>(
+                  ROCKSDB_NAMESPACE::BlockBasedTableOptions().index_shortening),
+              "BlockBasedTableOptions.index_shortening");
+
+DEFINE_uint32(metadata_charge_policy,
+              static_cast<uint32_t>(ROCKSDB_NAMESPACE::ShardedCacheOptions()
+                                        .metadata_charge_policy),
+              "ShardedCacheOptions.metadata_charge_policy");
+
+DEFINE_bool(use_adaptive_mutex_lru,
+            ROCKSDB_NAMESPACE::LRUCacheOptions().use_adaptive_mutex,
+            "LRUCacheOptions.use_adaptive_mutex");
+
+DEFINE_uint32(
+    compress_format_version,
+    static_cast<uint32_t>(ROCKSDB_NAMESPACE::CompressedSecondaryCacheOptions()
+                              .compress_format_version),
+    "CompressedSecondaryCacheOptions.compress_format_version");
+
+DEFINE_uint64(manifest_preallocation_size,
+              ROCKSDB_NAMESPACE::Options().manifest_preallocation_size,
+              "Options.manifest_preallocation_size");
+
+DEFINE_uint64(max_total_wal_size,
+              ROCKSDB_NAMESPACE::Options().max_total_wal_size,
+              "Options.max_total_wal_size");
+
+DEFINE_bool(enable_checksum_handoff, false,
+            "If true, include all the supported files in "
+            "Options.checksum_handoff_file. Otherwise include no files.");
+
+DEFINE_double(high_pri_pool_ratio,
+              ROCKSDB_NAMESPACE::LRUCacheOptions().high_pri_pool_ratio,
+              "LRUCacheOptions.high_pri_pool_ratio");
+
+DEFINE_double(low_pri_pool_ratio,
+              ROCKSDB_NAMESPACE::LRUCacheOptions().low_pri_pool_ratio,
+              "LRUCacheOptions.low_pri_pool_ratio");
+
+DEFINE_uint64(soft_pending_compaction_bytes_limit,
+              ROCKSDB_NAMESPACE::Options().soft_pending_compaction_bytes_limit,
+              "Options.soft_pending_compaction_bytes_limit");
+
+DEFINE_uint64(hard_pending_compaction_bytes_limit,
+              ROCKSDB_NAMESPACE::Options().hard_pending_compaction_bytes_limit,
+              "Options.hard_pending_compaction_bytes_limit");
+
+DEFINE_bool(enable_sst_partitioner_factory, false,
+            "If true, set Options.sst_partitioner_factory to "
+            "SstPartitionerFixedPrefixFactory with prefix length equal to 1");
+
+DEFINE_bool(
+    enable_do_not_compress_roles, false,
+    "If true, set CompressedSecondaryCacheOptions.do_not_compress_roles to "
+    "include all cache roles");
+
+DEFINE_bool(block_align,
+            ROCKSDB_NAMESPACE::BlockBasedTableOptions().block_align,
+            "BlockBasedTableOptions.block_align");
+
+DEFINE_uint32(
+    lowest_used_cache_tier,
+    static_cast<uint32_t>(ROCKSDB_NAMESPACE::Options().lowest_used_cache_tier),
+    "Options.lowest_used_cache_tier");
+
+DEFINE_bool(enable_custom_split_merge,
+            ROCKSDB_NAMESPACE::CompressedSecondaryCacheOptions()
+                .enable_custom_split_merge,
+            "CompressedSecondaryCacheOptions.enable_custom_split_merge");
+
+DEFINE_uint32(
+    adm_policy,
+    static_cast<uint32_t>(ROCKSDB_NAMESPACE::TieredCacheOptions().adm_policy),
+    "TieredCacheOptions.adm_policy");
+
+DEFINE_string(last_level_temperature, "kUnknown",
+              "Options.last_level_temperature");
+
+DEFINE_string(default_write_temperature, "kUnknown",
+              "Options.default_write_temperature");
+
+DEFINE_string(default_temperature, "kUnknown", "Options.default_temperature");
+
+DEFINE_bool(enable_memtable_insert_with_hint_prefix_extractor,
+            ROCKSDB_NAMESPACE::Options()
+                    .memtable_insert_with_hint_prefix_extractor != nullptr,
+            "If true and FLAGS_prefix_size > 0, set "
+            "Options.memtable_insert_with_hint_prefix_extractor to "
+            "be Options.prefix_extractor");
+
+DEFINE_bool(check_multiget_consistency, true,
+            "If true, check consistency of MultiGet result by comparing it "
+            "with Get's under a snapshot");
+
+DEFINE_bool(check_multiget_entity_consistency, true,
+            "If true, check consistency of MultiGetEntity result by comparing "
+            "it GetEntity's under a snapshot");
+
+DEFINE_bool(inplace_update_support,
+            ROCKSDB_NAMESPACE::Options().inplace_update_support,
+            "Options.inplace_update_support");
+
+DEFINE_uint32(uncache_aggressiveness,
+              ROCKSDB_NAMESPACE::ColumnFamilyOptions().uncache_aggressiveness,
+              "Aggressiveness of erasing cache entries that are likely "
+              "obsolete. 0 = disabled, 1 = minimum, 100 = moderate, 10000 = "
+              "normal max");
+
+DEFINE_bool(paranoid_memory_checks,
+            ROCKSDB_NAMESPACE::Options().paranoid_memory_checks,
+            "Sets CF option paranoid_memory_checks.");
+
+DEFINE_uint32(commit_bypass_memtable_one_in, 0,
+              "If greater than zero, transaction option will set "
+              "commit_bypass_memtable to per every N transactions on average.");
 #endif  // GFLAGS

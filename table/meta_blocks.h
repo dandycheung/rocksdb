@@ -73,6 +73,10 @@ class PropertyBlockBuilder {
  private:
   std::unique_ptr<BlockBuilder> properties_block_;
   stl_wrappers::KVMap props_;
+#ifndef NDEBUG
+  const Comparator* comparator_ = BytewiseComparator();
+  Slice last_prop_added_to_block_;
+#endif /* !NDEBUG */
 };
 
 // Were we encounter any error occurs during user-defined statistics collection,
@@ -88,11 +92,11 @@ void LogPropertiesCollectionError(Logger* info_log, const std::string& method,
 // property collectors.
 bool NotifyCollectTableCollectorsOnAdd(
     const Slice& key, const Slice& value, uint64_t file_size,
-    const std::vector<std::unique_ptr<IntTblPropCollector>>& collectors,
+    const std::vector<std::unique_ptr<InternalTblPropColl>>& collectors,
     Logger* info_log);
 
 void NotifyCollectTableCollectorsOnBlockAdd(
-    const std::vector<std::unique_ptr<IntTblPropCollector>>& collectors,
+    const std::vector<std::unique_ptr<InternalTblPropColl>>& collectors,
     uint64_t block_uncomp_bytes, uint64_t block_compressed_bytes_fast,
     uint64_t block_compressed_bytes_slow);
 
@@ -101,7 +105,7 @@ void NotifyCollectTableCollectorsOnBlockAdd(
 // It will also populate `user_collected_properties` and `readable_properties`
 // with the collected properties.
 bool NotifyCollectTableCollectorsOnFinish(
-    const std::vector<std::unique_ptr<IntTblPropCollector>>& collectors,
+    const std::vector<std::unique_ptr<InternalTblPropColl>>& collectors,
     Logger* info_log, PropertyBlockBuilder* builder,
     UserCollectedProperties& user_collected_properties,
     UserCollectedProperties& readable_properties);

@@ -298,7 +298,7 @@ class ClockCacheTest;
 
 // ----------------------------------------------------------------------- //
 
-struct ClockHandleBasicData {
+struct ClockHandleBasicData : public Cache::Handle {
   Cache::ObjectPtr value = nullptr;
   const Cache::CacheItemHelper* helper = nullptr;
   // A lossless, reversible hash of the fixed-size (16 byte) cache key. This
@@ -1127,6 +1127,12 @@ class BaseHyperClockCache : public ShardedCache<ClockCacheShard<Table>> {
   size_t GetCharge(Handle* handle) const override;
 
   const CacheItemHelper* GetCacheItemHelper(Handle* handle) const override;
+
+  void ApplyToHandle(
+      Cache* cache, Handle* handle,
+      const std::function<void(const Slice& key, Cache::ObjectPtr obj,
+                               size_t charge, const CacheItemHelper* helper)>&
+          callback) override;
 
   void ReportProblems(
       const std::shared_ptr<Logger>& /*info_log*/) const override;
